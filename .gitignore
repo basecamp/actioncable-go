@@ -1,0 +1,10 @@
+# Test and coverage output
+*.out
+*.test
+
+# Build output
+/dist/
+
+# Editor and OS noise
+.DS_Store
+*.swp
