@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -634,5 +636,56 @@ func TestHeaderIsCopied(t *testing.T) {
 
 	if sent := transport.dialedWith().Header.Get("Cookie"); sent != "session=secret" {
 		t.Fatalf("expected the header as it was given, got %q", sent)
+	}
+}
+
+func TestEveryDialAsksForTheHeaderAgain(t *testing.T) {
+	transport := newFakeTransport()
+	transport.failNextDial(errors.New("connection refused"))
+
+	var dials atomic.Int64
+	client := newTestClient(t, transport,
+		WithBackoff(time.Millisecond, time.Millisecond),
+		WithHeader(http.Header{"Origin": {"https://app.example.com"}}),
+		WithHeaderFunc(func(context.Context) (http.Header, error) {
+			return http.Header{"Authorization": {fmt.Sprintf("Bearer token-%d", dials.Add(1))}}, nil
+		}))
+
+	connecting := connect(client)
+	transport.accept(t).welcome(t)
+	if err := <-connecting; err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	dialed := transport.dialedWith().Header
+	if sent := dialed.Get("Authorization"); sent != "Bearer token-2" {
+		t.Fatalf("expected the redial to carry the credentials it asked for then, got %q", sent)
+	}
+	if sent := dialed.Get("Origin"); sent != "https://app.example.com" {
+		t.Fatalf("expected the headers set once to survive, got %q", sent)
+	}
+}
+
+func TestADialIsTurnedDownWhenTheHeaderCannotBeBuilt(t *testing.T) {
+	transport := newFakeTransport()
+
+	var asked atomic.Int64
+	client := newTestClient(t, transport,
+		WithBackoff(time.Millisecond, time.Millisecond),
+		WithHeaderFunc(func(context.Context) (http.Header, error) {
+			if asked.Add(1) == 1 {
+				return nil, errors.New("no credentials to hand over")
+			}
+			return http.Header{"Authorization": {"Bearer token"}}, nil
+		}))
+
+	connecting := connect(client)
+	transport.accept(t).welcome(t)
+	if err := <-connecting; err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	if sent := transport.dialedWith().Header.Get("Authorization"); sent != "Bearer token" {
+		t.Fatalf("expected the client to dial again after the header failed, got %q", sent)
 	}
 }

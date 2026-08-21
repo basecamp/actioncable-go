@@ -16,11 +16,12 @@ import (
 // running over it. Create one with New, start it with Connect, and hang up with
 // Close. It is safe for concurrent use.
 type Client struct {
-	url       string
-	transport Transport
-	protocols []Protocol
-	header    http.Header
-	logger    Logger
+	url        string
+	transport  Transport
+	protocols  []Protocol
+	header     http.Header
+	headerFunc func(ctx context.Context) (http.Header, error)
+	logger     Logger
 
 	staleAfter     time.Duration
 	subscribeRetry time.Duration
@@ -92,6 +93,30 @@ func (c *Client) assumeOrigin() {
 	if origin := originOf(c.url); origin != "" {
 		c.setHeader("Origin", origin)
 	}
+}
+
+// dialHeader is what the opening request carries. Without WithHeaderFunc that is
+// what was set once, at construction; with it, what the caller says now, laid over
+// the headers already there.
+func (c *Client) dialHeader(ctx context.Context) (http.Header, error) {
+	if c.headerFunc == nil {
+		return c.header, nil
+	}
+
+	current, err := c.headerFunc(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	header := c.header.Clone()
+	if header == nil {
+		header = http.Header{}
+	}
+	for name, values := range current {
+		header[name] = values
+	}
+
+	return header, nil
 }
 
 func originOf(rawURL string) string {
@@ -252,9 +277,14 @@ func (c *Client) session(ctx context.Context) error {
 		return c.stop(ErrNoProtocols)
 	}
 
+	header, err := c.dialHeader(ctx)
+	if err != nil {
+		return err
+	}
+
 	conn, err := c.transport.Dial(ctx, c.url, DialOptions{
 		Subprotocols: append(c.subprotocols(), SubprotocolUnsupported),
-		Header:       c.header,
+		Header:       header,
 	})
 	if err != nil {
 		return err
