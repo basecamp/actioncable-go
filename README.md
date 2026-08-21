@@ -123,6 +123,25 @@ client := actioncable.New("wss://example.com/cable",
 )
 ```
 
+A credential that expires should use `WithHeaderFunc`,
+which runs on every reconnect:
+
+```go
+client := actioncable.New("wss://example.com/cable",
+	actioncable.WithHeaderFunc(func(ctx context.Context) (http.Header, error) {
+		token, err := credentials.AccessToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return http.Header{"Authorization": {"Bearer " + token}}, nil
+	}),
+)
+```
+
+What it returns is merged over the headers already set, so an `Origin` or an API
+token given with `WithHeader` is kept. An error turns down that dial, and the
+client tries again on its backoff.
+
 Rails also checks the `Origin` header and rejects a request that doesn't carry
 one. By default, the `Origin` is set to the server's URL, so `wss://example.com/cable`
 sends `https://example.com`. 

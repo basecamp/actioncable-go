@@ -1,6 +1,7 @@
 package actioncable
 
 import (
+	"context"
 	"net/http"
 	"slices"
 	"time"
@@ -32,6 +33,18 @@ func WithAdditionalProtocols(protocols ...Protocol) Option {
 // goes.
 func WithHeader(header http.Header) Option {
 	return func(c *Client) { c.header = header.Clone() }
+}
+
+// WithHeaderFunc sets the headers the same way WithHeader does, except that it is
+// asked on every dial rather than once. A client reconnects on its own for as long
+// as it runs, which is longer than a credential that expires lives, and a reconnect
+// carrying the token the first dial used would be turned down for good. What this
+// returns is laid over the headers already set, so an Origin or a token given with
+// WithHeader survives.
+//
+// An error turns down that dial, and the client tries again on its backoff.
+func WithHeaderFunc(build func(ctx context.Context) (http.Header, error)) Option {
+	return func(c *Client) { c.headerFunc = build }
 }
 
 // WithCookie is shorthand for sending one Cookie header.
