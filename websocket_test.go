@@ -42,6 +42,23 @@ func TestWebSocketTransportSendsHeaders(t *testing.T) {
 	assert.Equal(t, "/cable", request.URL.Path)
 }
 
+func TestWebSocketTransportNeutralizesHeaderInjection(t *testing.T) {
+	server := newTestServer(t)
+
+	conn := dial(t, server, DialOptions{
+		Header: http.Header{"Authorization": {"Bearer token\r\nX-Injected: gotcha"}},
+	})
+	defer conn.Close()
+
+	request := server.accept(t).request
+	if injected := request.Header.Get("X-Injected"); injected != "" {
+		t.Fatalf("expected the newlines to be neutralized, got X-Injected: %q", injected)
+	}
+	if authorization := request.Header.Get("Authorization"); !strings.HasPrefix(authorization, "Bearer token") {
+		t.Fatalf("expected the authorization header to survive, got %q", authorization)
+	}
+}
+
 func TestWebSocketTransportRoundTripsMessages(t *testing.T) {
 	server := newTestServer(t)
 	conn := dial(t, server, DialOptions{Subprotocols: []string{SubprotocolV1JSON}})
