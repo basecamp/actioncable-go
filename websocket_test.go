@@ -12,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWebSocketTransportNegotiatesTheSubprotocol(t *testing.T) {
@@ -20,12 +23,8 @@ func TestWebSocketTransportNegotiatesTheSubprotocol(t *testing.T) {
 	conn := dial(t, server, DialOptions{Subprotocols: []string{SubprotocolV1JSON}})
 	defer conn.Close()
 
-	if conn.Subprotocol() != SubprotocolV1JSON {
-		t.Fatalf("expected %s, got %q", SubprotocolV1JSON, conn.Subprotocol())
-	}
-	if requested := server.accept(t).request.Header.Get("Sec-WebSocket-Protocol"); requested != SubprotocolV1JSON {
-		t.Fatalf("expected the client to offer %s, got %q", SubprotocolV1JSON, requested)
-	}
+	assert.Equal(t, SubprotocolV1JSON, conn.Subprotocol())
+	assert.Equal(t, SubprotocolV1JSON, server.accept(t).request.Header.Get("Sec-WebSocket-Protocol"), "expected the client to offer the subprotocol")
 }
 
 func TestWebSocketTransportSendsHeaders(t *testing.T) {
@@ -38,15 +37,9 @@ func TestWebSocketTransportSendsHeaders(t *testing.T) {
 	defer conn.Close()
 
 	request := server.accept(t).request
-	if cookie := request.Header.Get("Cookie"); cookie != "session=secret" {
-		t.Fatalf("expected the cookie to be sent, got %q", cookie)
-	}
-	if origin := request.Header.Get("Origin"); origin != "https://example.com" {
-		t.Fatalf("expected the origin to be sent, got %q", origin)
-	}
-	if request.URL.Path != "/cable" {
-		t.Fatalf("expected /cable, got %q", request.URL.Path)
-	}
+	assert.Equal(t, "session=secret", request.Header.Get("Cookie"))
+	assert.Equal(t, "https://example.com", request.Header.Get("Origin"))
+	assert.Equal(t, "/cable", request.URL.Path)
 }
 
 func TestWebSocketTransportRoundTripsMessages(t *testing.T) {
@@ -55,17 +48,11 @@ func TestWebSocketTransportRoundTripsMessages(t *testing.T) {
 	defer conn.Close()
 	peer := server.accept(t)
 
-	if err := conn.Write(context.Background(), []byte(`{"command":"subscribe"}`)); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if sent := peer.read(t); sent != `{"command":"subscribe"}` {
-		t.Fatalf("server received %s", sent)
-	}
+	require.NoError(t, conn.Write(context.Background(), []byte(`{"command":"subscribe"}`)), "Write")
+	assert.Equal(t, `{"command":"subscribe"}`, peer.read(t))
 
 	peer.write(t, opText, []byte(`{"type":"welcome"}`))
-	if received := string(read(t, conn)); received != `{"type":"welcome"}` {
-		t.Fatalf("client received %s", received)
-	}
+	assert.Equal(t, `{"type":"welcome"}`, string(read(t, conn)))
 }
 
 func TestWebSocketTransportAnswersPings(t *testing.T) {
@@ -77,12 +64,11 @@ func TestWebSocketTransportAnswersPings(t *testing.T) {
 	peer.write(t, opPing, []byte("beat"))
 	peer.write(t, opText, []byte("after the ping"))
 
-	if received := string(read(t, conn)); received != "after the ping" {
-		t.Fatalf("client received %s", received)
-	}
-	if frame := peer.readFrame(t); frame.opcode != opPong || string(frame.payload) != "beat" {
-		t.Fatalf("expected a pong carrying the ping payload, got opcode %#x %q", frame.opcode, frame.payload)
-	}
+	assert.Equal(t, "after the ping", string(read(t, conn)))
+
+	frame := peer.readFrame(t)
+	assert.Equal(t, byte(opPong), frame.opcode, "expected a pong")
+	assert.Equal(t, "beat", string(frame.payload), "expected the pong to carry the ping payload")
 }
 
 func TestWebSocketTransportReassemblesFragments(t *testing.T) {
@@ -95,9 +81,7 @@ func TestWebSocketTransportReassemblesFragments(t *testing.T) {
 	peer.writeFragment(t, opPing, []byte("interleaved"), true)
 	peer.writeFragment(t, opContinuation, []byte("message"), true)
 
-	if received := string(read(t, conn)); received != "one message" {
-		t.Fatalf("client received %q", received)
-	}
+	assert.Equal(t, "one message", string(read(t, conn)))
 }
 
 func TestWebSocketTransportReadsLargeMessages(t *testing.T) {
@@ -108,16 +92,10 @@ func TestWebSocketTransportReadsLargeMessages(t *testing.T) {
 
 	long := strings.Repeat("cable", 30_000)
 	peer.write(t, opText, []byte(long))
-	if received := string(read(t, conn)); received != long {
-		t.Fatalf("expected %d bytes, got %d", len(long), len(received))
-	}
+	assert.Equal(t, long, string(read(t, conn)))
 
-	if err := conn.Write(context.Background(), []byte(long)); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if sent := peer.read(t); sent != long {
-		t.Fatalf("server received %d bytes, expected %d", len(sent), len(long))
-	}
+	require.NoError(t, conn.Write(context.Background(), []byte(long)), "Write")
+	assert.Equal(t, long, peer.read(t))
 }
 
 func TestWebSocketTransportRefusesOversizedMessages(t *testing.T) {
@@ -125,15 +103,12 @@ func TestWebSocketTransportRefusesOversizedMessages(t *testing.T) {
 	transport := &WebSocketTransport{MaxMessageSize: 8}
 
 	conn, err := transport.Dial(context.Background(), server.url(), DialOptions{})
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
+	require.NoError(t, err, "Dial")
 	defer conn.Close()
 
 	server.accept(t).write(t, opText, []byte("far too long for eight bytes"))
-	if _, err := readWithin(conn); err == nil {
-		t.Fatal("expected an error for an oversized message")
-	}
+	_, err = readWithin(conn)
+	require.Error(t, err, "expected an error for an oversized message")
 }
 
 func TestWebSocketTransportReportsServerClose(t *testing.T) {
@@ -143,9 +118,8 @@ func TestWebSocketTransportReportsServerClose(t *testing.T) {
 
 	server.accept(t).write(t, opClose, binary.BigEndian.AppendUint16(nil, 1001))
 
-	if _, err := readWithin(conn); err == nil {
-		t.Fatal("expected an error after the server closed")
-	}
+	_, err := readWithin(conn)
+	require.Error(t, err, "expected an error after the server closed")
 }
 
 func TestWebSocketTransportRefusesANonUpgradeResponse(t *testing.T) {
@@ -155,9 +129,8 @@ func TestWebSocketTransportRefusesANonUpgradeResponse(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	transport := &WebSocketTransport{}
-	if _, err := transport.Dial(context.Background(), websocketURL(server.URL), DialOptions{}); err == nil {
-		t.Fatal("expected an error for a server that refuses to upgrade")
-	}
+	_, err := transport.Dial(context.Background(), websocketURL(server.URL), DialOptions{})
+	require.Error(t, err, "expected an error for a server that refuses to upgrade")
 }
 
 func TestWebSocketTransportRefusesABadAcceptKey(t *testing.T) {
@@ -165,9 +138,8 @@ func TestWebSocketTransportRefusesABadAcceptKey(t *testing.T) {
 	server.badAccept = true
 
 	transport := &WebSocketTransport{}
-	if _, err := transport.Dial(context.Background(), server.url(), DialOptions{}); err == nil {
-		t.Fatal("expected an error for a bad Sec-WebSocket-Accept")
-	}
+	_, err := transport.Dial(context.Background(), server.url(), DialOptions{})
+	require.Error(t, err, "expected an error for a bad Sec-WebSocket-Accept")
 }
 
 func TestWebSocketTransportHonorsContextCancellation(t *testing.T) {
@@ -179,9 +151,8 @@ func TestWebSocketTransportHonorsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	if _, err := conn.Read(ctx); err == nil {
-		t.Fatal("expected Read to give up with the context")
-	}
+	_, err := conn.Read(ctx)
+	require.Error(t, err, "expected Read to give up with the context")
 }
 
 // TestClientOverTheRealTransport runs the whole cable dance over an actual
@@ -194,42 +165,28 @@ func TestClientOverTheRealTransport(t *testing.T) {
 	connecting := connect(client)
 	peer := server.accept(t)
 	peer.write(t, opText, []byte(`{"type":"welcome"}`))
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
 	subscribing := subscribe(client, room())
-	if command := peer.read(t); command != `{"command":"subscribe","identifier":"{\"channel\":\"RoomChannel\",\"id\":42}"}` {
-		t.Fatalf("server received %s", command)
-	}
+	assert.Equal(t, `{"command":"subscribe","identifier":"{\"channel\":\"RoomChannel\",\"id\":42}"}`, peer.read(t))
 	peer.write(t, opText, []byte(`{"type":"confirm_subscription","identifier":"{\"channel\":\"RoomChannel\",\"id\":42}"}`))
 
 	result := <-subscribing
-	if result.err != nil {
-		t.Fatalf("Subscribe: %v", result.err)
-	}
+	require.NoError(t, result.err, "Subscribe")
 	subscription := result.subscription
 
 	peer.write(t, opText, []byte(`{"identifier":"{\"channel\":\"RoomChannel\",\"id\":42}","message":{"body":"Hello!"}}`))
-	if body := receive(t, subscription).String(); body != `{"body":"Hello!"}` {
-		t.Fatalf("client received %s", body)
-	}
+	assert.Equal(t, `{"body":"Hello!"}`, receive(t, subscription).String())
 
-	if err := subscription.Perform(context.Background(), "speak", map[string]any{"body": "Hi!"}); err != nil {
-		t.Fatalf("Perform: %v", err)
-	}
-	if command := peer.read(t); command != `{"command":"message","identifier":"{\"channel\":\"RoomChannel\",\"id\":42}","data":"{\"action\":\"speak\",\"body\":\"Hi!\"}"}` {
-		t.Fatalf("server received %s", command)
-	}
+	require.NoError(t, subscription.Perform(context.Background(), "speak", map[string]any{"body": "Hi!"}), "Perform")
+	assert.Equal(t, `{"command":"message","identifier":"{\"channel\":\"RoomChannel\",\"id\":42}","data":"{\"action\":\"speak\",\"body\":\"Hi!\"}"}`, peer.read(t))
 }
 
 func dial(t *testing.T, server *testServer, options DialOptions) Conn {
 	t.Helper()
 
 	conn, err := (&WebSocketTransport{}).Dial(context.Background(), server.url(), options)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
+	require.NoError(t, err, "Dial")
 
 	return conn
 }
@@ -238,9 +195,7 @@ func read(t *testing.T, conn Conn) []byte {
 	t.Helper()
 
 	payload, err := readWithin(conn)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
+	require.NoError(t, err, "Read")
 
 	return payload
 }
@@ -328,9 +283,7 @@ func (c *peerConn) read(t *testing.T) string {
 	t.Helper()
 
 	frame := c.readFrame(t)
-	if frame.opcode != opText {
-		t.Fatalf("expected a text frame, got opcode %#x", frame.opcode)
-	}
+	require.Equal(t, byte(opText), frame.opcode, "expected a text frame")
 
 	return string(frame.payload)
 }
@@ -339,9 +292,7 @@ func (c *peerConn) readFrame(t *testing.T) webSocketFrame {
 	t.Helper()
 
 	frame, err := c.tryReadFrame()
-	if err != nil {
-		t.Fatalf("reading a frame: %v", err)
-	}
+	require.NoError(t, err, "reading a frame")
 
 	return frame
 }
@@ -461,9 +412,8 @@ func TestWebSocketTransportRefusesAMaskedServerFrame(t *testing.T) {
 	// frame must fail the connection rather than quietly unmask it.
 	server.accept(t).writeMasked(t, opText, []byte(`{"type":"welcome"}`))
 
-	if payload, err := readWithin(conn); err == nil {
-		t.Fatalf("expected a masked frame to fail the connection, got %s", payload)
-	}
+	payload, err := readWithin(conn)
+	require.Error(t, err, "expected a masked frame to fail the connection, got %s", payload)
 }
 
 func TestWebSocketTransportRepliesToACloseOnce(t *testing.T) {
@@ -472,12 +422,9 @@ func TestWebSocketTransportRepliesToACloseOnce(t *testing.T) {
 	peer := server.accept(t)
 
 	peer.write(t, opClose, binary.BigEndian.AppendUint16(nil, 1000))
-	if _, err := readWithin(conn); err == nil {
-		t.Fatal("expected an error after the server closed")
-	}
+	_, err := readWithin(conn)
+	require.Error(t, err, "expected an error after the server closed")
 	conn.Close()
 
-	if closes := peer.closeFrames(t); closes != 1 {
-		t.Fatalf("expected exactly one close frame in reply, got %d", closes)
-	}
+	assert.Equal(t, 1, peer.closeFrames(t), "expected exactly one close frame in reply")
 }

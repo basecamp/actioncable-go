@@ -1,11 +1,14 @@
 package actioncable
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
 
 func TestV1JSONSubprotocol(t *testing.T) {
-	if subprotocol := (V1JSON{}).Subprotocol(); subprotocol != "actioncable-v1-json" {
-		t.Fatalf("expected actioncable-v1-json, got %q", subprotocol)
-	}
+	assert.Equal(t, "actioncable-v1-json", V1JSON{}.Subprotocol())
 }
 
 func TestV1JSONEncode(t *testing.T) {
@@ -29,12 +32,8 @@ func TestV1JSONEncode(t *testing.T) {
 
 	for _, expected := range commands {
 		encoded, err := V1JSON{}.Encode(expected.command)
-		if err != nil {
-			t.Fatalf("encoding %s: %v", expected.command.Name, err)
-		}
-		if string(encoded) != expected.encoded {
-			t.Fatalf("expected %s, got %s", expected.encoded, encoded)
-		}
+		require.NoError(t, err, "encoding %s", expected.command.Name)
+		assert.Equal(t, expected.encoded, string(encoded))
 	}
 }
 
@@ -69,26 +68,16 @@ func TestV1JSONDecode(t *testing.T) {
 
 	for _, frame := range frames {
 		incoming, err := V1JSON{}.Decode([]byte(frame.payload))
-		if err != nil {
-			t.Fatalf("decoding %s: %v", frame.payload, err)
-		}
-		if incoming.Kind != frame.expected.Kind {
-			t.Fatalf("expected kind %d for %s, got %d", frame.expected.Kind, frame.payload, incoming.Kind)
-		}
-		if incoming.Identifier != frame.expected.Identifier {
-			t.Fatalf("expected identifier %q for %s, got %q", frame.expected.Identifier, frame.payload, incoming.Identifier)
-		}
-		if incoming.Message.String() != frame.expected.Message.String() {
-			t.Fatalf("expected message %s for %s, got %s", frame.expected.Message, frame.payload, incoming.Message)
-		}
-		if incoming.Reason != frame.expected.Reason || incoming.Reconnect != frame.expected.Reconnect {
-			t.Fatalf("expected %q/%v for %s, got %q/%v", frame.expected.Reason, frame.expected.Reconnect, frame.payload, incoming.Reason, incoming.Reconnect)
-		}
+		require.NoError(t, err, "decoding %s", frame.payload)
+		assert.Equal(t, frame.expected.Kind, incoming.Kind, frame.payload)
+		assert.Equal(t, frame.expected.Identifier, incoming.Identifier, frame.payload)
+		assert.Equal(t, frame.expected.Message.String(), incoming.Message.String(), frame.payload)
+		assert.Equal(t, frame.expected.Reason, incoming.Reason, frame.payload)
+		assert.Equal(t, frame.expected.Reconnect, incoming.Reconnect, frame.payload)
 	}
 }
 
 func TestV1JSONDecodeGarbage(t *testing.T) {
-	if _, err := (V1JSON{}).Decode([]byte("not json")); err == nil {
-		t.Fatal("expected an error decoding garbage")
-	}
+	_, err := (V1JSON{}).Decode([]byte("not json"))
+	require.Error(t, err, "expected an error decoding garbage")
 }

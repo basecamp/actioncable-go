@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // wait is how long a test will hang around for something that should already
@@ -42,9 +44,7 @@ func welcomed(t *testing.T, client *Client, transport *fakeTransport) *fakeConn 
 	connecting := connect(client)
 	conn := transport.accept(t)
 	conn.welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
 	return conn
 }
@@ -74,9 +74,7 @@ func subscribed(t *testing.T, client *Client, conn *fakeConn) *Subscription {
 	conn.confirm(t, roomIdentifier)
 
 	result := <-subscribing
-	if result.err != nil {
-		t.Fatalf("Subscribe: %v", result.err)
-	}
+	require.NoError(t, result.err, "Subscribe")
 
 	return result.subscription
 }

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // fakeTransport hands out in-memory connections a test can play the server on.
@@ -166,9 +168,7 @@ func (c *fakeConn) command(tb testing.TB) v1JSONCommand {
 	payload := c.sent(tb)
 
 	var command v1JSONCommand
-	if err := json.Unmarshal(payload, &command); err != nil {
-		tb.Fatalf("decoding command %s: %v", payload, err)
-	}
+	require.NoError(tb, json.Unmarshal(payload, &command), "decoding command %s", payload)
 
 	return command
 }
@@ -177,9 +177,8 @@ func (c *fakeConn) expectCommand(tb testing.TB, name CommandName, identifier str
 	tb.Helper()
 
 	command := c.command(tb)
-	if command.Command != string(name) || command.Identifier != identifier {
-		tb.Fatalf("expected %s for %s, got %s for %s", name, identifier, command.Command, command.Identifier)
-	}
+	require.Equal(tb, string(name), command.Command)
+	require.Equal(tb, identifier, command.Identifier)
 
 	return command
 }
