@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var roomIdentifier = `{"channel":"RoomChannel","id":42}`
@@ -28,12 +30,8 @@ func TestConnectWaitsForTheWelcome(t *testing.T) {
 	}
 
 	conn.welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	if !client.Connected() {
-		t.Fatal("client is not connected after the welcome")
-	}
+	require.NoError(t, <-connecting, "Connect")
+	require.True(t, client.Connected(), "client is not connected after the welcome")
 }
 
 func TestConnectRetriesUntilTheServerAnswers(t *testing.T) {
@@ -44,9 +42,7 @@ func TestConnectRetriesUntilTheServerAnswers(t *testing.T) {
 	connecting := connect(client)
 	transport.accept(t).welcome(t)
 
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 }
 
 func TestSubscribeReceivesMessages(t *testing.T) {
@@ -61,23 +57,15 @@ func TestSubscribeReceivesMessages(t *testing.T) {
 	conn.confirm(t, roomIdentifier)
 
 	result := <-subscribing
-	if result.err != nil {
-		t.Fatalf("Subscribe: %v", result.err)
-	}
+	require.NoError(t, result.err, "Subscribe")
 	subscription := result.subscription
-	if reconnected := <-connections; reconnected {
-		t.Fatal("first connection reported itself as a reconnect")
-	}
+	assert.False(t, <-connections, "first connection reported itself as a reconnect")
 
 	conn.push(t, `{"identifier":`+quote(roomIdentifier)+`,"message":{"body":"Hello!"}}`)
 
 	var said struct{ Body string }
-	if err := receive(t, subscription).Unmarshal(&said); err != nil {
-		t.Fatalf("decoding the message: %v", err)
-	}
-	if said.Body != "Hello!" {
-		t.Fatalf("expected body Hello!, got %q", said.Body)
-	}
+	require.NoError(t, receive(t, subscription).Unmarshal(&said), "decoding the message")
+	assert.Equal(t, "Hello!", said.Body)
 }
 
 func TestSubscribeRejected(t *testing.T) {
@@ -91,9 +79,7 @@ func TestSubscribeRejected(t *testing.T) {
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.push(t, `{"type":"reject_subscription","identifier":`+quote(roomIdentifier)+`}`)
 
-	if err := (<-subscribing).err; !errors.Is(err, ErrRejected) {
-		t.Fatalf("expected ErrRejected, got %v", err)
-	}
+	require.ErrorIs(t, (<-subscribing).err, ErrRejected)
 	select {
 	case <-rejections:
 	case <-time.After(wait):
@@ -107,14 +93,10 @@ func TestPerformSendsAnAction(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	if err := subscription.Perform(context.Background(), "speak", map[string]any{"body": "Hello!"}); err != nil {
-		t.Fatalf("Perform: %v", err)
-	}
+	require.NoError(t, subscription.Perform(context.Background(), "speak", map[string]any{"body": "Hello!"}), "Perform")
 
 	command := conn.expectCommand(t, CommandMessage, roomIdentifier)
-	if command.Data != `{"action":"speak","body":"Hello!"}` {
-		t.Fatalf("expected the action alongside the data, got %s", command.Data)
-	}
+	assert.Equal(t, `{"action":"speak","body":"Hello!"}`, command.Data, "expected the action alongside the data")
 }
 
 func TestSendDeliversDataWithoutAnAction(t *testing.T) {
@@ -123,14 +105,10 @@ func TestSendDeliversDataWithoutAnAction(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	if err := subscription.Send(context.Background(), map[string]any{"body": "Hello!"}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
+	require.NoError(t, subscription.Send(context.Background(), map[string]any{"body": "Hello!"}), "Send")
 
 	command := conn.expectCommand(t, CommandMessage, roomIdentifier)
-	if command.Data != `{"body":"Hello!"}` {
-		t.Fatalf("expected the data on its own, got %s", command.Data)
-	}
+	assert.Equal(t, `{"body":"Hello!"}`, command.Data, "expected the data on its own")
 }
 
 func TestSendRefusesDataThatCannotEncode(t *testing.T) {
@@ -139,9 +117,7 @@ func TestSendRefusesDataThatCannotEncode(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	if err := subscription.Send(context.Background(), func() {}); err == nil {
-		t.Fatal("expected an error for a payload that can't encode")
-	}
+	require.Error(t, subscription.Send(context.Background(), func() {}), "expected an error for a payload that can't encode")
 }
 
 func TestPerformRefusesDataThatIsNotAnObject(t *testing.T) {
@@ -150,9 +126,7 @@ func TestPerformRefusesDataThatIsNotAnObject(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	if err := subscription.Perform(context.Background(), "speak", []string{"nope"}); err == nil {
-		t.Fatal("expected an error for a non-object payload")
-	}
+	require.Error(t, subscription.Perform(context.Background(), "speak", []string{"nope"}), "expected an error for a non-object payload")
 }
 
 func TestUnsubscribeClosesMessagesAndTellsTheServer(t *testing.T) {
@@ -161,16 +135,12 @@ func TestUnsubscribeClosesMessagesAndTellsTheServer(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	if err := subscription.Unsubscribe(context.Background()); err != nil {
-		t.Fatalf("Unsubscribe: %v", err)
-	}
+	require.NoError(t, subscription.Unsubscribe(context.Background()), "Unsubscribe")
 	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 
 	select {
 	case _, open := <-subscription.Messages():
-		if open {
-			t.Fatal("messages channel is still delivering after Unsubscribe")
-		}
+		assert.False(t, open, "messages channel is still delivering after Unsubscribe")
 	case <-time.After(wait):
 		t.Fatal("messages channel was never closed")
 	}
@@ -189,25 +159,19 @@ func TestReconnectResubscribes(t *testing.T) {
 	)
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.confirm(t, roomIdentifier)
-	if err := (<-subscribing).err; err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	require.NoError(t, (<-subscribing).err, "Subscribe")
 	<-connections
 
 	conn.Close()
 
-	if willReconnect := <-disconnections; !willReconnect {
-		t.Fatal("disconnect reported that the client would not reconnect")
-	}
+	require.True(t, <-disconnections, "disconnect reported that the client would not reconnect")
 
 	reconnected := transport.accept(t)
 	reconnected.welcome(t)
 	reconnected.expectCommand(t, CommandSubscribe, roomIdentifier)
 	reconnected.confirm(t, roomIdentifier)
 
-	if !<-connections {
-		t.Fatal("expected the confirmation after a reconnect to report reconnected")
-	}
+	assert.True(t, <-connections, "expected the confirmation after a reconnect to report reconnected")
 }
 
 func TestStaleConnectionIsReplaced(t *testing.T) {
@@ -219,9 +183,7 @@ func TestStaleConnectionIsReplaced(t *testing.T) {
 
 	connecting := connect(client)
 	transport.accept(t).welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
 	// Say nothing at all: no pings, no messages. The connection goes stale.
 	transport.accept(t).welcome(t)
@@ -237,9 +199,7 @@ func TestUnconfirmedSubscribeIsRetried(t *testing.T) {
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 
 	conn.confirm(t, roomIdentifier)
-	if err := (<-subscribing).err; err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	require.NoError(t, (<-subscribing).err, "Subscribe")
 }
 
 func TestServerDisconnectWithoutReconnectStopsTheClient(t *testing.T) {
@@ -250,16 +210,12 @@ func TestServerDisconnectWithoutReconnectStopsTheClient(t *testing.T) {
 	conn.push(t, `{"type":"disconnect","reason":"unauthorized","reconnect":false}`)
 
 	transport.refuseDial(t)
-	if client.Connected() {
-		t.Fatal("client is still connected after being told to go away")
-	}
+	assert.False(t, client.Connected(), "client is still connected after being told to go away")
 
 	var disconnect *DisconnectError
-	if _, err := client.Subscribe(context.Background(), room()); !errors.As(err, &disconnect) {
-		t.Fatalf("expected a DisconnectError, got %v", err)
-	} else if disconnect.Reason != ReasonUnauthorized {
-		t.Fatalf("expected the unauthorized reason, got %q", disconnect.Reason)
-	}
+	_, err := client.Subscribe(context.Background(), room())
+	require.ErrorAs(t, err, &disconnect)
+	assert.Equal(t, ReasonUnauthorized, disconnect.Reason)
 }
 
 func TestServerDisconnectWithReconnectDialsAgain(t *testing.T) {
@@ -279,10 +235,7 @@ func TestClientOffersEveryProtocolAndTheSentinel(t *testing.T) {
 	welcomed(t, client, transport)
 
 	offered := transport.dialedWith().Subprotocols
-	expected := []string{SubprotocolV1JSON, "actioncable-v2-json", SubprotocolUnsupported}
-	if !slices.Equal(offered, expected) {
-		t.Fatalf("expected to offer %v, got %v", expected, offered)
-	}
+	assert.Equal(t, []string{SubprotocolV1JSON, "actioncable-v2-json", SubprotocolUnsupported}, offered)
 }
 
 func TestAdditionalProtocolsAreOfferedFirst(t *testing.T) {
@@ -292,10 +245,7 @@ func TestAdditionalProtocolsAreOfferedFirst(t *testing.T) {
 	welcomed(t, client, transport)
 
 	offered := transport.dialedWith().Subprotocols
-	expected := []string{"actioncable-v2-json", SubprotocolV1JSON, SubprotocolUnsupported}
-	if !slices.Equal(offered, expected) {
-		t.Fatalf("expected to offer %v, got %v", expected, offered)
-	}
+	assert.Equal(t, []string{"actioncable-v2-json", SubprotocolV1JSON, SubprotocolUnsupported}, offered)
 }
 
 func TestClientSpeaksTheProtocolTheServerPicked(t *testing.T) {
@@ -306,9 +256,8 @@ func TestClientSpeaksTheProtocolTheServerPicked(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscribe(client, room())
 
-	if sent := conn.sent(t); !bytes.HasPrefix(sent, []byte("v2:")) {
-		t.Fatalf("expected the negotiated protocol to encode the subscribe, got %s", sent)
-	}
+	sent := conn.sent(t)
+	assert.True(t, bytes.HasPrefix(sent, []byte("v2:")), "expected the negotiated protocol to encode the subscribe, got %s", sent)
 }
 
 func TestUnsupportedSentinelStopsTheClient(t *testing.T) {
@@ -316,9 +265,7 @@ func TestUnsupportedSentinelStopsTheClient(t *testing.T) {
 	transport.subprotocol = SubprotocolUnsupported
 	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
 
-	if err := client.Connect(context.Background()); !errors.Is(err, ErrUnsupportedSubprotocol) {
-		t.Fatalf("expected ErrUnsupportedSubprotocol, got %v", err)
-	}
+	require.ErrorIs(t, client.Connect(context.Background()), ErrUnsupportedSubprotocol)
 
 	transport.accept(t)
 	transport.refuseDial(t)
@@ -328,9 +275,7 @@ func TestNoProtocolsStopsTheClient(t *testing.T) {
 	transport := newFakeTransport()
 	client := newTestClient(t, transport, WithProtocols())
 
-	if err := client.Connect(context.Background()); !errors.Is(err, ErrNoProtocols) {
-		t.Fatalf("expected ErrNoProtocols, got %v", err)
-	}
+	require.ErrorIs(t, client.Connect(context.Background()), ErrNoProtocols)
 
 	transport.refuseDial(t)
 }
@@ -340,9 +285,7 @@ func TestUnsupportedSubprotocolStopsTheClient(t *testing.T) {
 	transport.subprotocol = "actioncable-v9-telepathy"
 	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
 
-	if err := client.Connect(context.Background()); !errors.Is(err, ErrUnsupportedSubprotocol) {
-		t.Fatalf("expected ErrUnsupportedSubprotocol, got %v", err)
-	}
+	require.ErrorIs(t, client.Connect(context.Background()), ErrUnsupportedSubprotocol)
 
 	transport.accept(t)
 	transport.refuseDial(t)
@@ -351,9 +294,8 @@ func TestUnsupportedSubprotocolStopsTheClient(t *testing.T) {
 func TestSubscribeBeforeConnect(t *testing.T) {
 	client := newTestClient(t, newFakeTransport())
 
-	if _, err := client.Subscribe(context.Background(), room()); !errors.Is(err, ErrNotConnected) {
-		t.Fatalf("expected ErrNotConnected, got %v", err)
-	}
+	_, err := client.Subscribe(context.Background(), room())
+	require.ErrorIs(t, err, ErrNotConnected)
 }
 
 func TestCloseClosesSubscriptions(t *testing.T) {
@@ -362,16 +304,11 @@ func TestCloseClosesSubscriptions(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	require.NoError(t, client.Close(), "Close")
 
-	if _, open := <-subscription.Messages(); open {
-		t.Fatal("messages channel is still delivering after Close")
-	}
-	if err := subscription.Perform(context.Background(), "speak", nil); !errors.Is(err, ErrNotConnected) {
-		t.Fatalf("expected ErrNotConnected after Close, got %v", err)
-	}
+	_, open := <-subscription.Messages()
+	assert.False(t, open, "messages channel is still delivering after Close")
+	require.ErrorIs(t, subscription.Perform(context.Background(), "speak", nil), ErrNotConnected, "after Close")
 }
 
 func TestMessagesArriveOnEverySubscriptionSharingAnIdentifier(t *testing.T) {
@@ -385,31 +322,23 @@ func TestMessagesArriveOnEverySubscriptionSharingAnIdentifier(t *testing.T) {
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.confirm(t, roomIdentifier)
 	second := <-subscribing
-	if second.err != nil {
-		t.Fatalf("Subscribe: %v", second.err)
-	}
+	require.NoError(t, second.err, "Subscribe")
 
 	conn.push(t, `{"identifier":`+quote(roomIdentifier)+`,"message":{"body":"Hello!"}}`)
 
 	for _, subscription := range []*Subscription{first, second.subscription} {
-		if body := receive(t, subscription).String(); body != `{"body":"Hello!"}` {
-			t.Fatalf("expected the broadcast, got %s", body)
-		}
+		assert.Equal(t, `{"body":"Hello!"}`, receive(t, subscription).String(), "expected the broadcast")
 	}
 
 	// Only the last subscription standing tells the server to unsubscribe.
-	if err := first.Unsubscribe(context.Background()); err != nil {
-		t.Fatalf("Unsubscribe: %v", err)
-	}
+	require.NoError(t, first.Unsubscribe(context.Background()), "Unsubscribe")
 	select {
 	case command := <-conn.outgoing:
 		t.Fatalf("expected no command while a subscription remains, got %s", command)
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	if err := second.subscription.Unsubscribe(context.Background()); err != nil {
-		t.Fatalf("Unsubscribe: %v", err)
-	}
+	require.NoError(t, second.subscription.Unsubscribe(context.Background()), "Unsubscribe")
 	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 }
 
@@ -418,13 +347,9 @@ func TestConnectAfterCloseReportsWhyItStopped(t *testing.T) {
 	client := newTestClient(t, transport)
 	welcomed(t, client, transport)
 
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	require.NoError(t, client.Close(), "Close")
 
-	if err := client.Connect(context.Background()); !errors.Is(err, ErrClosed) {
-		t.Fatalf("expected ErrClosed, got %v", err)
-	}
+	require.ErrorIs(t, client.Connect(context.Background()), ErrClosed)
 	transport.refuseDial(t)
 }
 
@@ -432,16 +357,10 @@ func TestCloseBeforeConnectLeavesTheClientDead(t *testing.T) {
 	transport := newFakeTransport()
 	client := newTestClient(t, transport)
 
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
+	require.NoError(t, client.Close(), "Close")
 
-	if err := client.Connect(context.Background()); !errors.Is(err, ErrClosed) {
-		t.Fatalf("expected ErrClosed, got %v", err)
-	}
-	if client.Connected() {
-		t.Fatal("a client closed before it started reports itself connected")
-	}
+	require.ErrorIs(t, client.Connect(context.Background()), ErrClosed)
+	assert.False(t, client.Connected(), "a client closed before it started reports itself connected")
 	transport.refuseDial(t)
 }
 
@@ -454,17 +373,13 @@ func TestCloseFromOnDisconnected(t *testing.T) {
 	subscribing := subscribe(client, room(), OnDisconnected(func(bool) { closing <- client.Close() }))
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.confirm(t, roomIdentifier)
-	if err := (<-subscribing).err; err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	require.NoError(t, (<-subscribing).err, "Subscribe")
 
 	conn.Close()
 
 	select {
 	case err := <-closing:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+		require.NoError(t, err, "Close")
 	case <-time.After(wait):
 		t.Fatal("Close from OnDisconnected never returned")
 	}
@@ -479,16 +394,12 @@ func TestSubscribeFromOnConnected(t *testing.T) {
 	subscribing := subscribe(client, room(), OnConnected(func(bool) {
 		go func() {
 			_, err := client.Subscribe(context.Background(), Identifier{Channel: "OtherChannel"})
-			if err != nil {
-				t.Errorf("Subscribe from OnConnected: %v", err)
-			}
+			assert.NoError(t, err, "Subscribe from OnConnected")
 		}()
 	}))
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.confirm(t, roomIdentifier)
-	if err := (<-subscribing).err; err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	require.NoError(t, (<-subscribing).err, "Subscribe")
 
 	conn.expectCommand(t, CommandSubscribe, other)
 	conn.confirm(t, other)
@@ -508,9 +419,7 @@ func TestUnsubscribeWhileMessagesArrive(t *testing.T) {
 			conn.push(t, `{"identifier":`+quote(roomIdentifier)+`,"message":{"body":"Hello!"}}`)
 		}()
 
-		if err := subscription.Unsubscribe(context.Background()); err != nil {
-			t.Fatalf("Unsubscribe: %v", err)
-		}
+		require.NoError(t, subscription.Unsubscribe(context.Background()), "Unsubscribe")
 		<-pushed
 		conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 	}
@@ -524,21 +433,15 @@ func TestFirstConnectionIsNotAReconnect(t *testing.T) {
 	connecting := connect(client)
 	conn := transport.accept(t)
 	conn.welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
 	connections := make(chan bool, 1)
 	subscribing := subscribe(client, room(), OnConnected(func(reconnected bool) { connections <- reconnected }))
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.confirm(t, roomIdentifier)
-	if err := (<-subscribing).err; err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	require.NoError(t, (<-subscribing).err, "Subscribe")
 
-	if <-connections {
-		t.Fatal("a first connection that took two dials reported itself as a reconnect")
-	}
+	assert.False(t, <-connections, "a first connection that took two dials reported itself as a reconnect")
 }
 
 func TestPerformBeforeTheWelcomeIsRefused(t *testing.T) {
@@ -552,9 +455,7 @@ func TestPerformBeforeTheWelcomeIsRefused(t *testing.T) {
 
 	// The connection is up again but not yet welcomed, and the server throws
 	// away anything sent that early, so a command then is not a command landed.
-	if err := subscription.Perform(context.Background(), "speak", nil); !errors.Is(err, ErrNotConnected) {
-		t.Fatalf("expected ErrNotConnected, got %v", err)
-	}
+	require.ErrorIs(t, subscription.Perform(context.Background(), "speak", nil), ErrNotConnected)
 }
 
 func TestRepeatedConfirmationConnectsOnce(t *testing.T) {
@@ -566,9 +467,7 @@ func TestRepeatedConfirmationConnectsOnce(t *testing.T) {
 	subscribing := subscribe(client, room(), OnConnected(func(reconnected bool) { connections <- reconnected }))
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 	conn.confirm(t, roomIdentifier)
-	if err := (<-subscribing).err; err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
+	require.NoError(t, (<-subscribing).err, "Subscribe")
 	<-connections
 
 	conn.confirm(t, roomIdentifier)
@@ -596,13 +495,9 @@ func TestOriginDefaultsToTheCableURL(t *testing.T) {
 
 		connecting := connect(client)
 		transport.accept(t).welcome(t)
-		if err := <-connecting; err != nil {
-			t.Fatalf("Connect: %v", err)
-		}
+		require.NoError(t, <-connecting, "Connect")
 
-		if sent := transport.dialedWith().Header.Get("Origin"); sent != origin {
-			t.Fatalf("expected %s to dial with origin %s, got %q", url, origin, sent)
-		}
+		assert.Equal(t, origin, transport.dialedWith().Header.Get("Origin"), url)
 	}
 }
 
@@ -612,13 +507,9 @@ func TestExplicitOriginWins(t *testing.T) {
 
 	connecting := connect(client)
 	transport.accept(t).welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
-	if sent := transport.dialedWith().Header.Get("Origin"); sent != "https://app.example.com" {
-		t.Fatalf("expected the origin given, got %q", sent)
-	}
+	assert.Equal(t, "https://app.example.com", transport.dialedWith().Header.Get("Origin"), "expected the origin given")
 }
 
 func TestHeaderIsCopied(t *testing.T) {
@@ -630,13 +521,9 @@ func TestHeaderIsCopied(t *testing.T) {
 
 	connecting := connect(client)
 	transport.accept(t).welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
-	if sent := transport.dialedWith().Header.Get("Cookie"); sent != "session=secret" {
-		t.Fatalf("expected the header as it was given, got %q", sent)
-	}
+	assert.Equal(t, "session=secret", transport.dialedWith().Header.Get("Cookie"), "expected the header as it was given")
 }
 
 func TestEveryDialAsksForTheHeaderAgain(t *testing.T) {
@@ -653,17 +540,11 @@ func TestEveryDialAsksForTheHeaderAgain(t *testing.T) {
 
 	connecting := connect(client)
 	transport.accept(t).welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
 	dialed := transport.dialedWith().Header
-	if sent := dialed.Get("Authorization"); sent != "Bearer token-2" {
-		t.Fatalf("expected the redial to carry the credentials it asked for then, got %q", sent)
-	}
-	if sent := dialed.Get("Origin"); sent != "https://app.example.com" {
-		t.Fatalf("expected the headers set once to survive, got %q", sent)
-	}
+	assert.Equal(t, "Bearer token-2", dialed.Get("Authorization"), "expected the redial to carry the credentials it asked for then")
+	assert.Equal(t, "https://app.example.com", dialed.Get("Origin"), "expected the headers set once to survive")
 }
 
 func TestADialIsTurnedDownWhenTheHeaderCannotBeBuilt(t *testing.T) {
@@ -681,11 +562,7 @@ func TestADialIsTurnedDownWhenTheHeaderCannotBeBuilt(t *testing.T) {
 
 	connecting := connect(client)
 	transport.accept(t).welcome(t)
-	if err := <-connecting; err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
+	require.NoError(t, <-connecting, "Connect")
 
-	if sent := transport.dialedWith().Header.Get("Authorization"); sent != "Bearer token" {
-		t.Fatalf("expected the client to dial again after the header failed, got %q", sent)
-	}
+	assert.Equal(t, "Bearer token", transport.dialedWith().Header.Get("Authorization"), "expected the client to dial again after the header failed")
 }

@@ -1,6 +1,11 @@
 package actioncable
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
 
 func TestIdentifierKey(t *testing.T) {
 	identifiers := []struct {
@@ -17,22 +22,15 @@ func TestIdentifierKey(t *testing.T) {
 
 	for _, expected := range identifiers {
 		key, err := expected.identifier.key()
-		if err != nil {
-			t.Fatalf("keying %s: %v", expected.identifier.Channel, err)
-		}
-		if key != expected.key {
-			t.Fatalf("expected %s, got %s", expected.key, key)
-		}
-		if expected.identifier.String() != expected.key {
-			t.Fatalf("expected String to be the key, got %s", expected.identifier)
-		}
+		require.NoError(t, err, "keying %s", expected.identifier.Channel)
+		assert.Equal(t, expected.key, key)
+		assert.Equal(t, expected.key, expected.identifier.String(), "String should be the key")
 	}
 }
 
 func TestIdentifierKeyRefusesParamsItCannotEncode(t *testing.T) {
 	identifier := Identifier{Channel: "RoomChannel", Params: Params{"id": func() {}}}
 
-	if _, err := identifier.key(); err == nil {
-		t.Fatal("expected an error for params that don't encode")
-	}
+	_, err := identifier.key()
+	require.Error(t, err, "expected an error for params that don't encode")
 }
