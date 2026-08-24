@@ -39,7 +39,19 @@ func TestWebSocketTransportSendsHeaders(t *testing.T) {
 	request := server.accept(t).request
 	assert.Equal(t, "session=secret", request.Header.Get("Cookie"))
 	assert.Equal(t, "https://example.com", request.Header.Get("Origin"))
+	assert.Equal(t, "actioncable-go", request.Header.Get("User-Agent"))
 	assert.Equal(t, "/cable", request.URL.Path)
+}
+
+func TestWebSocketTransportSendsTheCallersUserAgent(t *testing.T) {
+	server := newTestServer(t)
+
+	conn := dial(t, server, DialOptions{
+		Header: http.Header{"User-Agent": {"custom-agent"}},
+	})
+	defer conn.Close()
+
+	assert.Equal(t, "custom-agent", server.accept(t).request.Header.Get("User-Agent"))
 }
 
 func TestWebSocketTransportNeutralizesHeaderInjection(t *testing.T) {

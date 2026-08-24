@@ -173,11 +173,13 @@ func (t *WebSocketTransport) upgrade(ctx context.Context, socket net.Conn, endpo
 }
 
 func writeUpgradeRequest(socket net.Conn, endpoint *url.URL, key string, options DialOptions) error {
-	header := http.Header{}
-	for name, values := range options.Header {
-		if !reservedHeader(name) {
-			header[http.CanonicalHeaderKey(name)] = values
-		}
+	header := options.Header.Clone()
+	if header == nil {
+		header = http.Header{}
+	}
+	header.Del("Sec-WebSocket-Extensions")
+	if _, present := header["User-Agent"]; !present {
+		header.Set("User-Agent", "actioncable-go")
 	}
 	header.Set("Upgrade", "websocket")
 	header.Set("Connection", "Upgrade")
@@ -185,6 +187,8 @@ func writeUpgradeRequest(socket net.Conn, endpoint *url.URL, key string, options
 	header.Set("Sec-WebSocket-Version", "13")
 	if len(options.Subprotocols) > 0 {
 		header.Set("Sec-WebSocket-Protocol", strings.Join(options.Subprotocols, ", "))
+	} else {
+		header.Del("Sec-WebSocket-Protocol")
 	}
 
 	request := &http.Request{
@@ -194,15 +198,6 @@ func writeUpgradeRequest(socket net.Conn, endpoint *url.URL, key string, options
 	}
 
 	return request.Write(socket)
-}
-
-func reservedHeader(name string) bool {
-	switch http.CanonicalHeaderKey(name) {
-	case "Host", "Upgrade", "Connection", "Sec-Websocket-Key", "Sec-Websocket-Version", "Sec-Websocket-Protocol", "Sec-Websocket-Extensions":
-		return true
-	default:
-		return false
-	}
 }
 
 func verifyUpgrade(response *http.Response, key string) error {
