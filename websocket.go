@@ -173,33 +173,27 @@ func (t *WebSocketTransport) upgrade(ctx context.Context, socket net.Conn, endpo
 }
 
 func writeUpgradeRequest(socket net.Conn, endpoint *url.URL, key string, options DialOptions) error {
-	request := &strings.Builder{}
-
-	target := endpoint.RequestURI()
-	if target == "" {
-		target = "/"
-	}
-	fmt.Fprintf(request, "GET %s HTTP/1.1\r\n", target)
-	fmt.Fprintf(request, "Host: %s\r\n", endpoint.Host)
-	fmt.Fprintf(request, "Upgrade: websocket\r\n")
-	fmt.Fprintf(request, "Connection: Upgrade\r\n")
-	fmt.Fprintf(request, "Sec-WebSocket-Key: %s\r\n", key)
-	fmt.Fprintf(request, "Sec-WebSocket-Version: 13\r\n")
-	if len(options.Subprotocols) > 0 {
-		fmt.Fprintf(request, "Sec-WebSocket-Protocol: %s\r\n", strings.Join(options.Subprotocols, ", "))
-	}
+	header := http.Header{}
 	for name, values := range options.Header {
-		if reservedHeader(name) {
-			continue
-		}
-		for _, value := range values {
-			fmt.Fprintf(request, "%s: %s\r\n", name, value)
+		if !reservedHeader(name) {
+			header[http.CanonicalHeaderKey(name)] = values
 		}
 	}
-	fmt.Fprintf(request, "\r\n")
+	header.Set("Upgrade", "websocket")
+	header.Set("Connection", "Upgrade")
+	header.Set("Sec-WebSocket-Key", key)
+	header.Set("Sec-WebSocket-Version", "13")
+	if len(options.Subprotocols) > 0 {
+		header.Set("Sec-WebSocket-Protocol", strings.Join(options.Subprotocols, ", "))
+	}
 
-	_, err := io.WriteString(socket, request.String())
-	return err
+	request := &http.Request{
+		Method: http.MethodGet,
+		URL:    endpoint,
+		Header: header,
+	}
+
+	return request.Write(socket)
 }
 
 func reservedHeader(name string) bool {
