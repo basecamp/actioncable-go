@@ -781,11 +781,36 @@ func TestAWelcomeResetsTheAttemptCount(t *testing.T) {
 	// Losing the connection is the first failed attempt of the outage, and the
 	// refused redial the second. Had the failure before the welcome still
 	// counted, that would have been the third.
-	conn.Close()
 	transport.failNextDial(errors.New("connection refused"))
+	conn.Close()
 
 	transport.accept(t).welcome(t)
 	assert.NoError(t, client.Err(), "a failure before the welcome should not count against the outage after it")
+}
+
+func TestGivingUpTellsSubscriptionsTheClientIsNotComingBack(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond), WithMaxAttempts(1))
+	conn := welcomed(t, client, transport)
+
+	disconnections := make(chan bool, 1)
+	subscribing := subscribe(client, room(), OnDisconnected(func(willReconnect bool) { disconnections <- willReconnect }))
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	conn.confirm(t, roomIdentifier)
+	require.NoError(t, (<-subscribing).err, "Subscribe")
+
+	// Losing the connection is the only attempt allowed, so the client is done
+	// for, and the subscription should hear that rather than a promise to return.
+	conn.Close()
+
+	assert.False(t, <-disconnections, "OnDisconnected promised a reconnect the client was about to give up on")
+	select {
+	case <-client.Done():
+	case <-time.After(wait):
+		t.Fatal("client kept running after its attempts ran out")
+	}
+	require.ErrorIs(t, client.Err(), ErrGaveUp)
+	transport.refuseDial(t)
 }
 
 func TestDoneAndErrFollowTheClient(t *testing.T) {

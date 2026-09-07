@@ -146,7 +146,9 @@ func originOf(rawURL string) string {
 //
 // ctx bounds the wait, not a connection that got through: that lives until Close.
 // A Connect that returns an error leaves the client stopped, with nothing running
-// behind it, so a client that failed to connect is one to throw away.
+// behind it, so a client that failed to connect is one to throw away. The one
+// exception is ErrAlreadyConnected, which says the client was running fine before
+// the call and still is.
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.stopped {
@@ -370,11 +372,6 @@ func (c *Client) run(ctx context.Context) {
 			return
 		}
 
-		if c.countAttempt(err) == c.maxAttempts {
-			c.stop(c.explain(ErrGaveUp))
-			return
-		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -391,7 +388,7 @@ func (c *Client) session(ctx context.Context) error {
 
 	header, err := c.dialHeader(ctx)
 	if err != nil {
-		return err
+		return c.failed(ctx, err)
 	}
 
 	conn, err := c.transport.Dial(ctx, c.url, DialOptions{
@@ -399,7 +396,7 @@ func (c *Client) session(ctx context.Context) error {
 		Header:       header,
 	})
 	if err != nil {
-		return err
+		return c.failed(ctx, err)
 	}
 	defer conn.Close()
 
@@ -424,7 +421,22 @@ func (c *Client) session(ctx context.Context) error {
 		<-guaranteed
 	}()
 
-	return c.receive(ctx, conn, protocol)
+	return c.failed(ctx, c.receive(ctx, conn, protocol))
+}
+
+// failed records why an attempt ended and, when that was the last one allowed,
+// stops the client. It runs ahead of the deferred disconnect so the subscriptions
+// hear that the client is not coming back rather than that it is.
+func (c *Client) failed(ctx context.Context, err error) error {
+	if c.isStopped() || ctx.Err() != nil {
+		return err
+	}
+
+	if c.countAttempt(err) == c.maxAttempts {
+		c.stop(c.explain(ErrGaveUp))
+	}
+
+	return err
 }
 
 // subprotocols names every protocol the client can speak, most preferred first.

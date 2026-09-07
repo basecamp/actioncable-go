@@ -88,7 +88,9 @@ that say no return an error. The rest are retried, so a server restart shows up
 in the log and the connection returns on its own.
 
 A `Connect` that returns an error leaves the client stopped, with nothing running
-behind it. Throw it away and make a new one.
+behind it. Throw it away and make a new one. The one exception is
+`ErrAlreadyConnected`, which means a `Connect` was already called on a client that
+is running fine.
 
 A client that stopped later on — the server hung up for good, or it ran out of
 attempts — says so through `Done` and `Err`:
