@@ -34,7 +34,7 @@ type Client struct {
 	conn Conn
 	// protocol is the one the server picked for the connection in hand.
 	protocol      Protocol
-	subscriptions map[string][]*Subscription
+	subscriptions map[string]*registration
 	attempts      int
 	reconnected   bool
 	welcomed      bool
@@ -66,7 +66,7 @@ func New(url string, options ...Option) *Client {
 		initialBackoff: time.Second,
 		longestBackoff: 30 * time.Second,
 		messageBuffer:  64,
-		subscriptions:  map[string][]*Subscription{},
+		subscriptions:  map[string]*registration{},
 		connected:      make(chan struct{}),
 		done:           make(chan struct{}),
 	}
@@ -179,6 +179,11 @@ func (c *Client) Connected() bool {
 // The subscription outlives reconnects — it is resubscribed automatically — so it
 // stays valid until Unsubscribe.
 //
+// Subscribing to an identifier the client already holds shares the server's one
+// subscription for it instead of asking for another, which Rails would ignore.
+// Every subscription sharing an identifier gets every message, and the server
+// hears unsubscribe from the last one to go.
+//
 // It returns ErrRejected when the channel turns the subscription down.
 func (c *Client) Subscribe(ctx context.Context, identifier Identifier, options ...SubscriptionOption) (*Subscription, error) {
 	key, err := identifier.key()
@@ -197,13 +202,30 @@ func (c *Client) Subscribe(ctx context.Context, identifier Identifier, options .
 		return nil, ErrNotConnected
 	}
 	subscription := newSubscription(c, key, c.messageBuffer, options)
-	c.subscriptions[key] = append(c.subscriptions[key], subscription)
+	registration, shared := c.subscriptions[key]
+	if !shared {
+		registration = newRegistration()
+		c.subscriptions[key] = registration
+	}
+	registration.holders = append(registration.holders, subscription)
+	confirmed := registration.confirmed
 	c.mu.Unlock()
 
-	if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: key}); err != nil {
-		// Nothing to do about it here: the connection will subscribe again as
-		// soon as it is welcomed back.
-		c.logger.Printf("actioncable: subscribing to %s: %v", key, err)
+	if confirmed {
+		// The server said yes to this identifier on the connection in hand and
+		// won't say so again, so the new holder is as confirmed as the rest.
+		subscription.confirm(false)
+		return subscription, nil
+	}
+
+	// A shared identifier's subscribe is already out, or goes out with the next
+	// welcome, and its verdict is this subscription's too.
+	if !shared {
+		if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: key}); err != nil {
+			// Nothing to do about it here: the connection will subscribe again as
+			// soon as it is welcomed back.
+			c.logger.Printf("actioncable: subscribing to %s: %v", key, err)
+		}
 	}
 
 	select {
@@ -400,15 +422,18 @@ func (c *Client) welcome(ctx context.Context) {
 	c.welcomed = true
 	c.reconnected = c.everWelcomed
 	c.everWelcomed = true
-	subscriptions := c.allSubscriptionsLocked()
+	identifiers := make([]string, 0, len(c.subscriptions))
+	for identifier, registration := range c.subscriptions {
+		registration.pending, registration.confirmed = true, false
+		identifiers = append(identifiers, identifier)
+	}
 	c.mu.Unlock()
 
 	c.connectedOnce.Do(func() { close(c.connected) })
 
-	for _, subscription := range subscriptions {
-		subscription.pending.Store(true)
-		if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: subscription.identifier}); err != nil {
-			c.logger.Printf("actioncable: resubscribing to %s: %v", subscription.identifier, err)
+	for _, identifier := range identifiers {
+		if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: identifier}); err != nil {
+			c.logger.Printf("actioncable: resubscribing to %s: %v", identifier, err)
 		}
 	}
 }
@@ -425,9 +450,9 @@ func (c *Client) guaranteeSubscriptions(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for _, subscription := range c.pendingSubscriptions() {
-				if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: subscription.identifier}); err != nil {
-					c.logger.Printf("actioncable: resubscribing to %s: %v", subscription.identifier, err)
+			for _, identifier := range c.pendingIdentifiers() {
+				if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: identifier}); err != nil {
+					c.logger.Printf("actioncable: resubscribing to %s: %v", identifier, err)
 				}
 			}
 		}
@@ -436,28 +461,36 @@ func (c *Client) guaranteeSubscriptions(ctx context.Context) {
 
 func (c *Client) confirm(identifier string) {
 	c.mu.Lock()
-	subscriptions, reconnected := c.subscriptions[identifier], c.reconnected
+	registration, reconnected := c.subscriptions[identifier], c.reconnected
+	// Only an identifier waiting on a verdict has news. The server can confirm
+	// twice when a retried subscribe crosses the first confirmation.
+	if registration == nil || !registration.pending {
+		c.mu.Unlock()
+		return
+	}
+	registration.pending, registration.confirmed = false, true
+	holders := registration.holders
 	c.mu.Unlock()
 
-	for _, subscription := range subscriptions {
+	for _, subscription := range holders {
 		subscription.confirm(reconnected)
 	}
 }
 
 func (c *Client) reject(identifier string) {
 	c.mu.Lock()
-	subscriptions := c.subscriptions[identifier]
+	holders := c.holdersLocked(identifier)
 	delete(c.subscriptions, identifier)
 	c.mu.Unlock()
 
-	for _, subscription := range subscriptions {
+	for _, subscription := range holders {
 		subscription.reject()
 	}
 }
 
 func (c *Client) deliver(incoming Incoming) {
 	c.mu.Lock()
-	subscriptions := c.subscriptions[incoming.Identifier]
+	subscriptions := c.holdersLocked(incoming.Identifier)
 	c.mu.Unlock()
 
 	if len(subscriptions) == 0 {
@@ -487,6 +520,9 @@ func (c *Client) disconnect() {
 	c.conn = nil
 	c.protocol = nil
 	c.welcomed = false
+	for _, registration := range c.subscriptions {
+		registration.pending, registration.confirmed = false, false
+	}
 	subscriptions := c.allSubscriptionsLocked()
 	willReconnect := !c.stopped
 	c.mu.Unlock()
@@ -523,7 +559,7 @@ func (c *Client) send(ctx context.Context, command Command) error {
 func (c *Client) forget(subscription *Subscription) bool {
 	c.mu.Lock()
 	remaining := []*Subscription{}
-	for _, candidate := range c.subscriptions[subscription.identifier] {
+	for _, candidate := range c.holdersLocked(subscription.identifier) {
 		if candidate != subscription {
 			remaining = append(remaining, candidate)
 		}
@@ -532,11 +568,10 @@ func (c *Client) forget(subscription *Subscription) bool {
 	if last {
 		delete(c.subscriptions, subscription.identifier)
 	} else {
-		c.subscriptions[subscription.identifier] = remaining
+		c.subscriptions[subscription.identifier].holders = remaining
 	}
 	c.mu.Unlock()
 
-	subscription.pending.Store(false)
 	subscription.close()
 
 	return last
@@ -545,7 +580,7 @@ func (c *Client) forget(subscription *Subscription) bool {
 func (c *Client) closeSubscriptions() {
 	c.mu.Lock()
 	subscriptions := c.allSubscriptionsLocked()
-	c.subscriptions = map[string][]*Subscription{}
+	c.subscriptions = map[string]*registration{}
 	c.mu.Unlock()
 
 	for _, subscription := range subscriptions {
@@ -553,23 +588,31 @@ func (c *Client) closeSubscriptions() {
 	}
 }
 
+func (c *Client) holdersLocked(identifier string) []*Subscription {
+	if registration := c.subscriptions[identifier]; registration != nil {
+		return registration.holders
+	} else {
+		return nil
+	}
+}
+
 func (c *Client) allSubscriptionsLocked() []*Subscription {
 	subscriptions := []*Subscription{}
-	for _, identified := range c.subscriptions {
-		subscriptions = append(subscriptions, identified...)
+	for _, registration := range c.subscriptions {
+		subscriptions = append(subscriptions, registration.holders...)
 	}
 
 	return subscriptions
 }
 
-func (c *Client) pendingSubscriptions() []*Subscription {
+func (c *Client) pendingIdentifiers() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	pending := []*Subscription{}
-	for _, subscription := range c.allSubscriptionsLocked() {
-		if subscription.pending.Load() {
-			pending = append(pending, subscription)
+	pending := []string{}
+	for identifier, registration := range c.subscriptions {
+		if registration.pending {
+			pending = append(pending, identifier)
 		}
 	}
 

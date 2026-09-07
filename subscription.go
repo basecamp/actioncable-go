@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"sync/atomic"
 )
 
 // A Subscription is one channel subscription on a client. Read what the channel
@@ -16,7 +15,6 @@ type Subscription struct {
 
 	confirmed chan struct{}
 	rejected  chan struct{}
-	pending   atomic.Bool
 
 	callbacks      *dispatcher
 	onConnected    func(reconnected bool)
@@ -42,13 +40,32 @@ func newSubscription(client *Client, identifier string, buffer int, options []Su
 		rejected:   make(chan struct{}),
 		callbacks:  newDispatcher(),
 	}
-	subscription.pending.Store(true)
 
 	for _, option := range options {
 		option(subscription)
 	}
 
 	return subscription
+}
+
+// A registration is the server's one subscription for an identifier, and every
+// Subscription here that shares it. Rails keeps one subscription per identifier
+// per connection and says nothing to a second subscribe for it, so the subscribe
+// command, its verdict, and the retries until then belong to the identifier
+// rather than to each holder. The client's mutex guards it.
+type registration struct {
+	holders []*Subscription
+
+	// pending is set while a subscribe is out on the connection in hand with no
+	// verdict yet, confirmed once the server said yes on it. Both clear when the
+	// connection drops: the next one starts over.
+	pending   bool
+	confirmed bool
+}
+
+// newRegistration starts out pending, since the subscribe goes out right behind it.
+func newRegistration() *registration {
+	return &registration{pending: true}
 }
 
 // Key is the JSON identifier string the server knows this subscription by, and
@@ -100,11 +117,6 @@ func (s *Subscription) Unsubscribe(ctx context.Context) error {
 }
 
 func (s *Subscription) confirm(reconnected bool) {
-	// Only a subscription that was waiting to be confirmed has news. The server
-	// can confirm twice when a retried subscribe crosses the first confirmation.
-	if !s.pending.Swap(false) {
-		return
-	}
 	s.confirmOnce.Do(func() { close(s.confirmed) })
 
 	if s.onConnected != nil {
@@ -113,7 +125,6 @@ func (s *Subscription) confirm(reconnected bool) {
 }
 
 func (s *Subscription) reject() {
-	s.pending.Store(false)
 	s.rejectOnce.Do(func() { close(s.rejected) })
 
 	if s.onRejected != nil {
@@ -123,8 +134,6 @@ func (s *Subscription) reject() {
 }
 
 func (s *Subscription) disconnect(willReconnect bool) {
-	s.pending.Store(false)
-
 	if s.onDisconnected != nil {
 		s.callbacks.dispatch(func() { s.onDisconnected(willReconnect) })
 	}
