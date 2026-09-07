@@ -238,8 +238,19 @@ func (c *Client) Subscribe(ctx context.Context, identifier Identifier, options .
 		c.forget(subscription)
 		return nil, c.stoppedBecause()
 	case <-ctx.Done():
-		c.forget(subscription)
+		c.abandon(subscription)
 		return nil, ctx.Err()
+	}
+}
+
+// abandon forgets a subscription its caller gave up waiting on. When it was the
+// last holder of an identifier the server has heard a subscribe for, the server
+// is told to let go, or it would keep the subscription and ignore the next
+// Subscribe for it as a duplicate. The connection may well be gone by now, and
+// then there is nothing to tell.
+func (c *Client) abandon(subscription *Subscription) {
+	if last, heard := c.forget(subscription); last && heard {
+		c.send(context.Background(), Command{Name: CommandUnsubscribe, Identifier: subscription.identifier})
 	}
 }
 
@@ -555,8 +566,9 @@ func (c *Client) send(ctx context.Context, command Command) error {
 }
 
 // forget drops a subscription and reports whether it was the last one holding
-// that identifier, which is when the server needs to hear about it.
-func (c *Client) forget(subscription *Subscription) bool {
+// that identifier, which is when the server needs to hear about it, and whether
+// the server has heard a subscribe for it on the connection in hand at all.
+func (c *Client) forget(subscription *Subscription) (last, heard bool) {
 	c.mu.Lock()
 	remaining := []*Subscription{}
 	for _, candidate := range c.holdersLocked(subscription.identifier) {
@@ -564,7 +576,10 @@ func (c *Client) forget(subscription *Subscription) bool {
 			remaining = append(remaining, candidate)
 		}
 	}
-	last := len(remaining) == 0
+	last = len(remaining) == 0
+	if registration := c.subscriptions[subscription.identifier]; registration != nil {
+		heard = registration.pending || registration.confirmed
+	}
 	if last {
 		delete(c.subscriptions, subscription.identifier)
 	} else {
@@ -574,7 +589,7 @@ func (c *Client) forget(subscription *Subscription) bool {
 
 	subscription.close()
 
-	return last
+	return last, heard
 }
 
 func (c *Client) closeSubscriptions() {

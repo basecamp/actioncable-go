@@ -109,7 +109,7 @@ func (s *Subscription) Send(ctx context.Context, data any) error {
 
 // Unsubscribe tells the server to drop the subscription and closes Messages.
 func (s *Subscription) Unsubscribe(ctx context.Context) error {
-	if last := s.client.forget(s); last {
+	if last, _ := s.client.forget(s); last {
 		return s.client.send(ctx, Command{Name: CommandUnsubscribe, Identifier: s.identifier})
 	} else {
 		return nil

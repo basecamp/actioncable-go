@@ -406,6 +406,29 @@ func TestSubscribersJoiningAnInFlightSubscribeFollowItThroughAReconnect(t *testi
 	require.NoError(t, (<-second).err, "Subscribe")
 }
 
+func TestCancellingTheOnlyInFlightSubscribeTellsTheServer(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	subscribing := make(chan error, 1)
+	go func() {
+		_, err := client.Subscribe(ctx, room())
+		subscribing <- err
+	}()
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+
+	// The server has the subscription whether or not anyone here still wants it,
+	// and would ignore the next subscribe for it unless told to let go.
+	cancel()
+	require.ErrorIs(t, <-subscribing, context.Canceled)
+	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
+	conn.expectNoCommand(t)
+
+	subscribed(t, client, conn)
+}
+
 func TestCancellingASubscriberJoiningAnInFlightSubscribeLeavesTheFirstWaiting(t *testing.T) {
 	transport := newFakeTransport()
 	client := newTestClient(t, transport)
