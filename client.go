@@ -175,14 +175,19 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 // giveUpWaiting stops a client whose Connect ran out of time, unless the welcome
-// landed in the same instant, in which case the connection is kept.
+// landed in the same instant, in which case the connection is kept. Both are
+// settled under one lock, so a welcome can't slip in between the check and the
+// stop and be torn down for its trouble.
 func (c *Client) giveUpWaiting(ctx context.Context) error {
-	select {
-	case <-c.connected:
+	c.mu.Lock()
+	if c.everWelcomed {
+		c.mu.Unlock()
 		return nil
-	default:
-		return c.shutdown(c.explain(ctx.Err()))
 	}
+	c.stopLocked(c.explainLocked(ctx.Err()))
+	c.mu.Unlock()
+
+	return c.awaitStopped()
 }
 
 // Connected reports whether a connection is up and welcomed.
@@ -323,10 +328,16 @@ func (c *Client) Close() error {
 // stopped, which is an earlier reason when there was one.
 func (c *Client) shutdown(reason error) error {
 	c.mu.Lock()
-	c.stopped = true
-	if c.failure == nil {
-		c.failure = reason
-	}
+	c.stopLocked(reason)
+	c.mu.Unlock()
+
+	return c.awaitStopped()
+}
+
+// awaitStopped hangs up whatever connection a stopped client still has open and
+// waits until nothing is running any more.
+func (c *Client) awaitStopped() error {
+	c.mu.Lock()
 	failure, cancel, conn := c.failure, c.cancel, c.conn
 	c.mu.Unlock()
 
@@ -723,10 +734,7 @@ func (c *Client) pendingIdentifiers() []string {
 // dialing again.
 func (c *Client) stop(err error) error {
 	c.mu.Lock()
-	c.stopped = true
-	if c.failure == nil {
-		c.failure = err
-	}
+	c.stopLocked(err)
 	cancel := c.cancel
 	c.mu.Unlock()
 
@@ -735,6 +743,15 @@ func (c *Client) stop(err error) error {
 	}
 
 	return err
+}
+
+// stopLocked marks the client stopped for the reason given, unless an earlier
+// reason already stands.
+func (c *Client) stopLocked(reason error) {
+	c.stopped = true
+	if c.failure == nil {
+		c.failure = reason
+	}
 }
 
 func (c *Client) finish() {
@@ -779,11 +796,14 @@ func (c *Client) countAttempt(err error) int {
 // out, so a deadline that ran out on bad credentials says so.
 func (c *Client) explain(err error) error {
 	c.mu.Lock()
-	lastErr := c.lastErr
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	if lastErr != nil {
-		return fmt.Errorf("%w (last attempt: %w)", err, lastErr)
+	return c.explainLocked(err)
+}
+
+func (c *Client) explainLocked(err error) error {
+	if c.lastErr != nil {
+		return fmt.Errorf("%w (last attempt: %w)", err, c.lastErr)
 	} else {
 		return err
 	}
