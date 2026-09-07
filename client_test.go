@@ -77,7 +77,7 @@ func TestSubscribeRejected(t *testing.T) {
 	subscribing := subscribe(client, room(), OnRejected(func() { rejections <- struct{}{} }))
 
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
-	conn.push(t, `{"type":"reject_subscription","identifier":`+quote(roomIdentifier)+`}`)
+	conn.reject(t, roomIdentifier)
 
 	require.ErrorIs(t, (<-subscribing).err, ErrRejected)
 	select {
@@ -195,7 +195,7 @@ func TestUnconfirmedSubscribeIsRetried(t *testing.T) {
 	conn := welcomed(t, client, transport)
 
 	subscribing := subscribe(client, room())
-	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	conn.dropCommand(t, CommandSubscribe, roomIdentifier)
 	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
 
 	conn.confirm(t, roomIdentifier)
@@ -317,29 +317,140 @@ func TestMessagesArriveOnEverySubscriptionSharingAnIdentifier(t *testing.T) {
 	conn := welcomed(t, client, transport)
 
 	first := subscribed(t, client, conn)
-
-	subscribing := subscribe(client, room())
-	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
-	conn.confirm(t, roomIdentifier)
-	second := <-subscribing
-	require.NoError(t, second.err, "Subscribe")
+	second, err := client.Subscribe(context.Background(), room())
+	require.NoError(t, err, "Subscribe")
 
 	conn.push(t, `{"identifier":`+quote(roomIdentifier)+`,"message":{"body":"Hello!"}}`)
 
-	for _, subscription := range []*Subscription{first, second.subscription} {
+	for _, subscription := range []*Subscription{first, second} {
 		assert.Equal(t, `{"body":"Hello!"}`, receive(t, subscription).String(), "expected the broadcast")
 	}
 
 	// Only the last subscription standing tells the server to unsubscribe.
 	require.NoError(t, first.Unsubscribe(context.Background()), "Unsubscribe")
-	select {
-	case command := <-conn.outgoing:
-		t.Fatalf("expected no command while a subscription remains, got %s", command)
-	case <-time.After(100 * time.Millisecond):
-	}
+	conn.expectNoCommand(t)
 
-	require.NoError(t, second.subscription.Unsubscribe(context.Background()), "Unsubscribe")
+	require.NoError(t, second.Unsubscribe(context.Background()), "Unsubscribe")
 	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
+}
+
+func TestSubscribeToAConfirmedIdentifierSendsNothing(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+	subscribed(t, client, conn)
+
+	// Rails has the identifier already and would ignore a second subscribe, so
+	// the one confirmation it gave stands for this subscription too.
+	connections := make(chan bool, 1)
+	_, err := client.Subscribe(context.Background(), room(), OnConnected(func(reconnected bool) { connections <- reconnected }))
+	require.NoError(t, err, "Subscribe")
+
+	assert.False(t, <-connections, "a subscription joining a confirmed identifier reported itself as a reconnect")
+	conn.expectNoCommand(t)
+}
+
+func TestSubscribersJoinAnInFlightSubscribe(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	first := subscribe(client, room())
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	second := subscribe(client, room())
+	third := subscribe(client, room())
+	conn.expectNoCommand(t)
+
+	conn.confirm(t, roomIdentifier)
+
+	for _, subscribing := range []<-chan subscribeResult{first, second, third} {
+		require.NoError(t, (<-subscribing).err, "Subscribe")
+	}
+}
+
+func TestSubscribersJoiningAnInFlightSubscribeShareItsRejection(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	first := subscribe(client, room())
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	second := subscribe(client, room())
+	conn.expectNoCommand(t)
+
+	conn.reject(t, roomIdentifier)
+
+	require.ErrorIs(t, (<-first).err, ErrRejected)
+	require.ErrorIs(t, (<-second).err, ErrRejected)
+}
+
+func TestSubscribersJoiningAnInFlightSubscribeFollowItThroughAReconnect(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
+	conn := welcomed(t, client, transport)
+
+	first := subscribe(client, room())
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	second := subscribe(client, room())
+	conn.expectNoCommand(t)
+
+	conn.Close()
+
+	reconnected := transport.accept(t)
+	reconnected.welcome(t)
+	reconnected.expectCommand(t, CommandSubscribe, roomIdentifier)
+	reconnected.expectNoCommand(t)
+	reconnected.confirm(t, roomIdentifier)
+
+	require.NoError(t, (<-first).err, "Subscribe")
+	require.NoError(t, (<-second).err, "Subscribe")
+}
+
+func TestCancellingTheOnlyInFlightSubscribeTellsTheServer(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	subscribing := make(chan error, 1)
+	go func() {
+		_, err := client.Subscribe(ctx, room())
+		subscribing <- err
+	}()
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+
+	// The server has the subscription whether or not anyone here still wants it,
+	// and would ignore the next subscribe for it unless told to let go.
+	cancel()
+	require.ErrorIs(t, <-subscribing, context.Canceled)
+	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
+	conn.expectNoCommand(t)
+
+	subscribed(t, client, conn)
+}
+
+func TestCancellingASubscriberJoiningAnInFlightSubscribeLeavesTheFirstWaiting(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	first := subscribe(client, room())
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	joining := make(chan error, 1)
+	go func() {
+		_, err := client.Subscribe(ctx, room())
+		joining <- err
+	}()
+	conn.expectNoCommand(t)
+
+	cancel()
+	require.ErrorIs(t, <-joining, context.Canceled)
+	conn.expectNoCommand(t)
+
+	conn.confirm(t, roomIdentifier)
+	require.NoError(t, (<-first).err, "Subscribe")
 }
 
 func TestConnectAfterCloseReportsWhyItStopped(t *testing.T) {
@@ -565,4 +676,40 @@ func TestADialIsTurnedDownWhenTheHeaderCannotBeBuilt(t *testing.T) {
 	require.NoError(t, <-connecting, "Connect")
 
 	assert.Equal(t, "Bearer token", transport.dialedWith().Header.Get("Authorization"), "expected the client to dial again after the header failed")
+}
+
+func TestAnUnsubscribeDuringAResubscribeGoesOutAfterIt(t *testing.T) {
+	transport := newFakeTransport()
+	transport.writeBuffer = 0
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
+	conn := welcomed(t, client, transport)
+
+	other := `{"channel":"OtherChannel"}`
+	subscribed(t, client, conn)
+	subscribing := subscribe(client, Identifier{Channel: "OtherChannel"})
+	conn.expectCommand(t, CommandSubscribe, other)
+	conn.confirm(t, other)
+	result := <-subscribing
+	require.NoError(t, result.err, "Subscribe")
+
+	conn.Close()
+
+	// The welcome sets the client resubscribing both. With nobody reading yet it
+	// is stuck mid-list on the first write, which is when the unsubscribe arrives
+	// and queues up behind it. Had it slipped in ahead of the second subscribe,
+	// the server would have been left holding OtherChannel with no one here to
+	// answer for it.
+	reconnected := transport.accept(t)
+	reconnected.welcome(t)
+	<-reconnected.writing
+	unsubscribing := make(chan error, 1)
+	go func() { unsubscribing <- result.subscription.Unsubscribe(context.Background()) }()
+	time.Sleep(20 * time.Millisecond)
+
+	first := reconnected.command(t)
+	second := reconnected.command(t)
+	assert.Equal(t, []string{string(CommandSubscribe), string(CommandSubscribe)}, []string{first.Command, second.Command}, "expected both resubscribes before anything else")
+	assert.ElementsMatch(t, []string{roomIdentifier, other}, []string{first.Identifier, second.Identifier})
+	reconnected.expectCommand(t, CommandUnsubscribe, other)
+	require.NoError(t, <-unsubscribing, "Unsubscribe")
 }

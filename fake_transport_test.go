@@ -17,6 +17,10 @@ import (
 type fakeTransport struct {
 	subprotocol string
 	dialed      chan *fakeConn
+	// writeBuffer is how many commands a connection takes before Write blocks on
+	// the test reading them. Zero makes every write wait, which lets a test hold
+	// the client mid-write.
+	writeBuffer int
 
 	mu       sync.Mutex
 	dialErrs []error
@@ -24,7 +28,7 @@ type fakeTransport struct {
 }
 
 func newFakeTransport() *fakeTransport {
-	return &fakeTransport{subprotocol: SubprotocolV1JSON, dialed: make(chan *fakeConn, 16)}
+	return &fakeTransport{subprotocol: SubprotocolV1JSON, dialed: make(chan *fakeConn, 16), writeBuffer: 32}
 }
 
 func (t *fakeTransport) Dial(ctx context.Context, url string, options DialOptions) (Conn, error) {
@@ -41,8 +45,10 @@ func (t *fakeTransport) Dial(ctx context.Context, url string, options DialOption
 	conn := &fakeConn{
 		subprotocol: t.subprotocol,
 		incoming:    make(chan []byte),
-		outgoing:    make(chan []byte, 32),
+		outgoing:    make(chan []byte, t.writeBuffer),
 		closed:      make(chan struct{}),
+		writing:     make(chan struct{}, 64),
+		subscribed:  map[string]bool{},
 	}
 	t.dialed <- conn
 
@@ -86,12 +92,21 @@ func (t *fakeTransport) refuseDial(tb testing.TB) {
 	}
 }
 
+// fakeConn is one connection with the test playing the server on the other end.
+// Like Rails it keeps one subscription per identifier: a subscribe for an
+// identifier it has already heard, answered or not, is ignored.
 type fakeConn struct {
 	subprotocol string
 	incoming    chan []byte
 	outgoing    chan []byte
 	closed      chan struct{}
 	closeOnce   sync.Once
+	// writing gets a tick as each Write begins, so a test can tell the client is
+	// stuck in one before anyone reads what it wrote.
+	writing chan struct{}
+
+	mu         sync.Mutex
+	subscribed map[string]bool
 }
 
 func (c *fakeConn) Subprotocol() string {
@@ -110,6 +125,15 @@ func (c *fakeConn) Read(ctx context.Context) ([]byte, error) {
 }
 
 func (c *fakeConn) Write(ctx context.Context, payload []byte) error {
+	if c.ignores(payload) {
+		return nil
+	}
+
+	select {
+	case c.writing <- struct{}{}:
+	default:
+	}
+
 	select {
 	case c.outgoing <- payload:
 		return nil
@@ -118,6 +142,20 @@ func (c *fakeConn) Write(ctx context.Context, payload []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// ignores reports whether the server would drop the command without a word: Rails
+// does that to a second subscribe for an identifier the connection already has.
+func (c *fakeConn) ignores(payload []byte) bool {
+	var command v1JSONCommand
+	if err := json.Unmarshal(payload, &command); err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return CommandName(command.Command) == CommandSubscribe && c.subscribed[command.Identifier]
 }
 
 func (c *fakeConn) Close() error {
@@ -148,6 +186,18 @@ func (c *fakeConn) confirm(tb testing.TB, identifier string) {
 	c.push(tb, `{"type":"confirm_subscription","identifier":`+quote(identifier)+`}`)
 }
 
+// reject turns a subscription down, which also forgets it: the client is free to
+// try again.
+func (c *fakeConn) reject(tb testing.TB, identifier string) {
+	tb.Helper()
+
+	c.mu.Lock()
+	delete(c.subscribed, identifier)
+	c.mu.Unlock()
+
+	c.push(tb, `{"type":"reject_subscription","identifier":`+quote(identifier)+`}`)
+}
+
 // sent waits for the next payload the client writes, exactly as it went out.
 func (c *fakeConn) sent(tb testing.TB) []byte {
 	tb.Helper()
@@ -161,8 +211,9 @@ func (c *fakeConn) sent(tb testing.TB) []byte {
 	}
 }
 
-// command waits for the next command the client sends.
-func (c *fakeConn) command(tb testing.TB) v1JSONCommand {
+// next waits for the next command the client sends. Nobody has heard it yet:
+// command and dropCommand settle that.
+func (c *fakeConn) next(tb testing.TB) v1JSONCommand {
 	tb.Helper()
 
 	payload := c.sent(tb)
@@ -173,6 +224,29 @@ func (c *fakeConn) command(tb testing.TB) v1JSONCommand {
 	return command
 }
 
+// command waits for the next command the client sends and takes it in the way
+// the server would.
+func (c *fakeConn) command(tb testing.TB) v1JSONCommand {
+	tb.Helper()
+
+	command := c.next(tb)
+	c.hear(command)
+
+	return command
+}
+
+func (c *fakeConn) hear(command v1JSONCommand) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch CommandName(command.Command) {
+	case CommandSubscribe:
+		c.subscribed[command.Identifier] = true
+	case CommandUnsubscribe:
+		delete(c.subscribed, command.Identifier)
+	}
+}
+
 func (c *fakeConn) expectCommand(tb testing.TB, name CommandName, identifier string) v1JSONCommand {
 	tb.Helper()
 
@@ -181,6 +255,27 @@ func (c *fakeConn) expectCommand(tb testing.TB, name CommandName, identifier str
 	require.Equal(tb, identifier, command.Identifier)
 
 	return command
+}
+
+// dropCommand lets the next command fall on the floor, the way the server drops
+// a subscribe that reaches it before the connection is set up.
+func (c *fakeConn) dropCommand(tb testing.TB, name CommandName, identifier string) {
+	tb.Helper()
+
+	command := c.next(tb)
+	require.Equal(tb, string(name), command.Command)
+	require.Equal(tb, identifier, command.Identifier)
+}
+
+// expectNoCommand fails when the client sends anything in the next little while.
+func (c *fakeConn) expectNoCommand(tb testing.TB) {
+	tb.Helper()
+
+	select {
+	case payload := <-c.outgoing:
+		tb.Fatalf("expected no command, got %s", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func quote(value string) string {

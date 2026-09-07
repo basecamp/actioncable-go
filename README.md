@@ -87,6 +87,13 @@ in the log and the connection returns on its own.
 `Subscribe` sends the subscription and waits for the channel to confirm it. It
 returns `ErrRejected` when the channel's `subscribed` method rejects it.
 
+Subscribing twice to the same identifier shares one subscription on the server.
+Rails keeps one per identifier per connection and ignores a second subscribe, so
+the client sends one, hands every message to each `Subscription`, and tells the
+server to unsubscribe when the last one does. A `Subscribe` that finds the
+identifier already confirmed returns right away; one that finds a subscribe still
+in flight waits for its verdict.
+
 `Messages` closes when the subscription is unsubscribed or the client is closed,
 so a range loop over it ends on its own.
 
