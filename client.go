@@ -326,7 +326,9 @@ func (c *Client) Close() error {
 }
 
 // shutdown stops the client for the reason given, hangs up whatever connection
-// is open, and waits until nothing is running any more. It returns why the client
+// is open, and waits for the connection goroutine to finish. Subscription
+// callbacks still queued run on their own goroutines after that, and each
+// subscription's Messages closes once its last one has. It returns why the client
 // stopped, which is an earlier reason when there was one.
 func (c *Client) shutdown(reason error) error {
 	c.mu.Lock()

@@ -135,11 +135,13 @@ func (s *Subscription) confirm(reconnected bool) {
 		return
 	}
 
-	s.confirmOnce.Do(func() { close(s.confirmed) })
-
+	// The callback is queued before the verdict is published: a Subscribe woken
+	// by the verdict may unsubscribe at once, and that must not get ahead of the
+	// callback for the event that woke it.
 	if s.onConnected != nil {
 		s.callbacks.dispatch(func() { s.onConnected(reconnected) })
 	}
+	s.confirmOnce.Do(func() { close(s.confirmed) })
 }
 
 func (s *Subscription) isClosed() bool {
@@ -150,11 +152,10 @@ func (s *Subscription) isClosed() bool {
 }
 
 func (s *Subscription) reject() {
-	s.rejectOnce.Do(func() { close(s.rejected) })
-
 	if s.onRejected != nil {
 		s.callbacks.dispatch(s.onRejected)
 	}
+	s.rejectOnce.Do(func() { close(s.rejected) })
 	s.close(s.rejection())
 }
 
