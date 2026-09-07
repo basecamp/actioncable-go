@@ -428,6 +428,9 @@ func (c *Client) dispatch(ctx context.Context, protocol Protocol, payload []byte
 // welcome resets the connection's health and resubscribes everything, the way
 // the server expects after every fresh connection.
 func (c *Client) welcome(ctx context.Context) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	c.mu.Lock()
 	c.attempts = 0
 	c.welcomed = true
@@ -442,11 +445,7 @@ func (c *Client) welcome(ctx context.Context) {
 
 	c.connectedOnce.Do(func() { close(c.connected) })
 
-	for _, identifier := range identifiers {
-		if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: identifier}); err != nil {
-			c.logger.Printf("actioncable: resubscribing to %s: %v", identifier, err)
-		}
-	}
+	c.resubscribeLocked(ctx, identifiers)
 }
 
 // guaranteeSubscriptions resends subscribe commands until they are confirmed. A
@@ -461,11 +460,23 @@ func (c *Client) guaranteeSubscriptions(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for _, identifier := range c.pendingIdentifiers() {
-				if err := c.send(ctx, Command{Name: CommandSubscribe, Identifier: identifier}); err != nil {
-					c.logger.Printf("actioncable: resubscribing to %s: %v", identifier, err)
-				}
-			}
+			c.writeMu.Lock()
+			c.resubscribeLocked(ctx, c.pendingIdentifiers())
+			c.writeMu.Unlock()
+		}
+	}
+}
+
+// resubscribeLocked sends a subscribe for each identifier. The caller holds
+// writeMu from before the identifiers were listed until this returns, so nothing
+// else can get a command out in between. Otherwise an Unsubscribe that lands
+// mid-list could write its unsubscribe ahead of the subscribe for the same
+// identifier, and the server would end up holding a subscription nobody here
+// knows about — one it would silently ignore every later subscribe for.
+func (c *Client) resubscribeLocked(ctx context.Context, identifiers []string) {
+	for _, identifier := range identifiers {
+		if err := c.write(ctx, Command{Name: CommandSubscribe, Identifier: identifier}); err != nil {
+			c.logger.Printf("actioncable: resubscribing to %s: %v", identifier, err)
 		}
 	}
 }
@@ -544,6 +555,14 @@ func (c *Client) disconnect() {
 }
 
 func (c *Client) send(ctx context.Context, command Command) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	return c.write(ctx, command)
+}
+
+// write puts one command on the connection. The caller holds writeMu.
+func (c *Client) write(ctx context.Context, command Command) error {
 	c.mu.Lock()
 	conn, protocol, welcomed := c.conn, c.protocol, c.welcomed
 	c.mu.Unlock()
@@ -558,9 +577,6 @@ func (c *Client) send(ctx context.Context, command Command) error {
 	if err != nil {
 		return fmt.Errorf("actioncable: encoding %s command: %w", command.Name, err)
 	}
-
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 
 	return conn.Write(ctx, payload)
 }

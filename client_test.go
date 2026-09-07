@@ -677,3 +677,39 @@ func TestADialIsTurnedDownWhenTheHeaderCannotBeBuilt(t *testing.T) {
 
 	assert.Equal(t, "Bearer token", transport.dialedWith().Header.Get("Authorization"), "expected the client to dial again after the header failed")
 }
+
+func TestAnUnsubscribeDuringAResubscribeGoesOutAfterIt(t *testing.T) {
+	transport := newFakeTransport()
+	transport.writeBuffer = 0
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
+	conn := welcomed(t, client, transport)
+
+	other := `{"channel":"OtherChannel"}`
+	subscribed(t, client, conn)
+	subscribing := subscribe(client, Identifier{Channel: "OtherChannel"})
+	conn.expectCommand(t, CommandSubscribe, other)
+	conn.confirm(t, other)
+	result := <-subscribing
+	require.NoError(t, result.err, "Subscribe")
+
+	conn.Close()
+
+	// The welcome sets the client resubscribing both. With nobody reading yet it
+	// is stuck mid-list on the first write, which is when the unsubscribe arrives
+	// and queues up behind it. Had it slipped in ahead of the second subscribe,
+	// the server would have been left holding OtherChannel with no one here to
+	// answer for it.
+	reconnected := transport.accept(t)
+	reconnected.welcome(t)
+	<-reconnected.writing
+	unsubscribing := make(chan error, 1)
+	go func() { unsubscribing <- result.subscription.Unsubscribe(context.Background()) }()
+	time.Sleep(20 * time.Millisecond)
+
+	first := reconnected.command(t)
+	second := reconnected.command(t)
+	assert.Equal(t, []string{string(CommandSubscribe), string(CommandSubscribe)}, []string{first.Command, second.Command}, "expected both resubscribes before anything else")
+	assert.ElementsMatch(t, []string{roomIdentifier, other}, []string{first.Identifier, second.Identifier})
+	reconnected.expectCommand(t, CommandUnsubscribe, other)
+	require.NoError(t, <-unsubscribing, "Unsubscribe")
+}

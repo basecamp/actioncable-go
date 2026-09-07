@@ -17,6 +17,10 @@ import (
 type fakeTransport struct {
 	subprotocol string
 	dialed      chan *fakeConn
+	// writeBuffer is how many commands a connection takes before Write blocks on
+	// the test reading them. Zero makes every write wait, which lets a test hold
+	// the client mid-write.
+	writeBuffer int
 
 	mu       sync.Mutex
 	dialErrs []error
@@ -24,7 +28,7 @@ type fakeTransport struct {
 }
 
 func newFakeTransport() *fakeTransport {
-	return &fakeTransport{subprotocol: SubprotocolV1JSON, dialed: make(chan *fakeConn, 16)}
+	return &fakeTransport{subprotocol: SubprotocolV1JSON, dialed: make(chan *fakeConn, 16), writeBuffer: 32}
 }
 
 func (t *fakeTransport) Dial(ctx context.Context, url string, options DialOptions) (Conn, error) {
@@ -41,8 +45,9 @@ func (t *fakeTransport) Dial(ctx context.Context, url string, options DialOption
 	conn := &fakeConn{
 		subprotocol: t.subprotocol,
 		incoming:    make(chan []byte),
-		outgoing:    make(chan []byte, 32),
+		outgoing:    make(chan []byte, t.writeBuffer),
 		closed:      make(chan struct{}),
+		writing:     make(chan struct{}, 64),
 		subscribed:  map[string]bool{},
 	}
 	t.dialed <- conn
@@ -96,6 +101,9 @@ type fakeConn struct {
 	outgoing    chan []byte
 	closed      chan struct{}
 	closeOnce   sync.Once
+	// writing gets a tick as each Write begins, so a test can tell the client is
+	// stuck in one before anyone reads what it wrote.
+	writing chan struct{}
 
 	mu         sync.Mutex
 	subscribed map[string]bool
@@ -119,6 +127,11 @@ func (c *fakeConn) Read(ctx context.Context) ([]byte, error) {
 func (c *fakeConn) Write(ctx context.Context, payload []byte) error {
 	if c.ignores(payload) {
 		return nil
+	}
+
+	select {
+	case c.writing <- struct{}{}:
+	default:
 	}
 
 	select {
