@@ -41,6 +41,7 @@ type Client struct {
 	everWelcomed  bool
 	stopped       bool
 	failure       error
+	ctx           context.Context
 	cancel        context.CancelFunc
 
 	// writeMu serializes writes to the connection. It is its own lock so a slow
@@ -152,7 +153,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return ErrAlreadyConnected
 	}
 	runContext, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	c.cancel = cancel
+	c.ctx, c.cancel = runContext, cancel
 	c.mu.Unlock()
 
 	go c.run(runContext)
@@ -248,10 +249,23 @@ func (c *Client) Subscribe(ctx context.Context, identifier Identifier, options .
 // is told to let go, or it would keep the subscription and ignore the next
 // Subscribe for it as a duplicate. The connection may well be gone by now, and
 // then there is nothing to tell.
+//
+// The caller's context is what just ended, so the unsubscribe goes out on the
+// client's own. It is sent before returning rather than in the background so a
+// Subscribe for the same identifier that follows can't get ahead of it.
 func (c *Client) abandon(subscription *Subscription) {
 	if last, heard := c.forget(subscription); last && heard {
-		c.send(context.Background(), Command{Name: CommandUnsubscribe, Identifier: subscription.identifier})
+		c.send(c.runContext(), Command{Name: CommandUnsubscribe, Identifier: subscription.identifier})
 	}
+}
+
+// runContext is the one the connection runs under, which outlives any the caller
+// holds and ends with the client.
+func (c *Client) runContext() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.ctx
 }
 
 // Close hangs up, stops reconnecting, and closes every subscription's message

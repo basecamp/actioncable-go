@@ -116,12 +116,25 @@ func (s *Subscription) Unsubscribe(ctx context.Context) error {
 	}
 }
 
+// confirm passes the server's verdict on. A holder that unsubscribed between the
+// registration's holders being listed and this call has nothing to hear.
 func (s *Subscription) confirm(reconnected bool) {
+	if s.isClosed() {
+		return
+	}
+
 	s.confirmOnce.Do(func() { close(s.confirmed) })
 
 	if s.onConnected != nil {
 		s.callbacks.dispatch(func() { s.onConnected(reconnected) })
 	}
+}
+
+func (s *Subscription) isClosed() bool {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
+	return s.closed
 }
 
 func (s *Subscription) reject() {
