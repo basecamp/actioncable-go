@@ -28,6 +28,14 @@ var (
 	// ErrNoProtocols is returned when there is nothing to offer the server,
 	// which means WithProtocols was called without any protocols.
 	ErrNoProtocols = errors.New("actioncable: no protocols to offer")
+
+	// ErrGaveUp is returned by a client that stopped because it failed as many
+	// attempts in a row as WithMaxAttempts allows. It wraps the last attempt's
+	// error.
+	ErrGaveUp = errors.New("actioncable: gave up connecting")
+
+	// ErrUnsubscribed is reported by a subscription's Err after Unsubscribe.
+	ErrUnsubscribed = errors.New("actioncable: unsubscribed")
 )
 
 // A DisconnectError reports that the server sent a disconnect frame.

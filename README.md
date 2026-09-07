@@ -69,7 +69,8 @@ if err := client.Connect(ctx); err != nil {
 The errors worth handling:
 
 - `context.DeadlineExceeded` or `context.Canceled`, when the context ends before
-  the welcome arrives. The server hasn't answered yet.
+  the welcome arrives. The error also wraps whatever the last attempt failed on,
+  so a header that couldn't be built or a refused dial shows up in it.
 - `*DisconnectError`, when the server sends a disconnect message. `Reason` is one
   of four strings:
     * `ReasonUnauthorized` — authentication or authorization failed.
@@ -79,10 +80,29 @@ The errors worth handling:
       `ActionCable.server.disconnect`.
 - `ErrUnsupportedSubprotocol`, when the server picks a protocol this client
   doesn't speak.
+- `ErrGaveUp`, when `WithMaxAttempts` is set and that many attempts failed in a
+  row. It wraps the last attempt's error.
 
 A disconnect message says whether the client should re-connect. Only the ones
 that say no return an error. The rest are retried, so a server restart shows up
 in the log and the connection returns on its own.
+
+A `Connect` that returns an error leaves the client stopped, with nothing running
+behind it. Throw it away and make a new one.
+
+A client that stopped later on — the server hung up for good, or it ran out of
+attempts — says so through `Done` and `Err`:
+
+```go
+select {
+case <-client.Done():
+	log.Printf("cable stopped: %v", client.Err())
+case <-ctx.Done():
+}
+```
+
+`Err` is nil while the client runs, and afterwards one of the errors above or
+`ErrClosed`. A stopped client doesn't come back; make a new one.
 
 `Subscribe` sends the subscription and waits for the channel to confirm it. It
 returns `ErrRejected` when the channel's `subscribed` method rejects it.
@@ -94,8 +114,18 @@ server to unsubscribe when the last one does. A `Subscribe` that finds the
 identifier already confirmed returns right away; one that finds a subscribe still
 in flight waits for its verdict.
 
-`Messages` closes when the subscription is unsubscribed or the client is closed,
-so a range loop over it ends on its own.
+`Messages` closes when the subscription is unsubscribed, rejected, or the client
+stops, so a range loop over it ends on its own. `Err` on the subscription says
+which it was: `ErrUnsubscribed`, `ErrRejected`, or whatever stopped the client.
+
+```go
+for message := range room.Messages() {
+	handle(message)
+}
+if !errors.Is(room.Err(), actioncable.ErrUnsubscribed) {
+	log.Printf("subscription ended: %v", room.Err())
+}
+```
 
 Read it promptly. A subscription buffers 64 messages, and a message that arrives
 while the buffer is full gets dropped and logged rather than stalling the 
@@ -190,7 +220,12 @@ client is coming back or has stopped for good.
 `OnRejected` runs when the channel rejects the subscription.
 
 Callbacks run on their own goroutine, one at a time, in order. `Close`,
-`Subscribe`, and `Unsubscribe` all work from inside one.
+`Subscribe`, and `Unsubscribe` all work from inside one. `Messages` closes only
+after the last callback has returned, so once a range over it ends, no callback
+is still running or about to.
+
+`Unsubscribe` takes no context. The command goes out on the client's own
+connection, so it works during a teardown whose context has already ended.
 
 
 ## Staying connected
@@ -200,14 +235,19 @@ seconds of silence the client treats the connection as dead, drops it, and dials
 again after a second, then two, then four, up to thirty. Each delay carries a
 little jitter, so a restarted server doesn't get every client back at once.
 
-Both are configurable:
+Both are configurable, and the retrying can be capped:
 
 ```go
 client := actioncable.New("wss://example.com/cable",
 	actioncable.WithStaleAfter(10*time.Second),
 	actioncable.WithBackoff(time.Second, 30*time.Second),
+	actioncable.WithMaxAttempts(10),
 )
 ```
+
+By default the client keeps dialing until `Close`. With `WithMaxAttempts` it stops
+with `ErrGaveUp` after that many failures in a row; a welcome resets the count, so
+it bounds one outage rather than the client's lifetime.
 
 Subscriptions come back on their own. The client resubscribes all of them on the
 new connection, then resends a subscribe every half second until the server

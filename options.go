@@ -42,7 +42,9 @@ func WithHeader(header http.Header) Option {
 // returns is laid over the headers already set, so an Origin or a token given with
 // WithHeader survives.
 //
-// An error turns down that dial, and the client tries again on its backoff.
+// An error turns down that dial, and the client tries again on its backoff. A
+// Connect that runs out of time or attempts meanwhile reports the error alongside
+// its own, so a credential that can't be built doesn't hide behind a deadline.
 func WithHeaderFunc(build func(ctx context.Context) (http.Header, error)) Option {
 	return func(c *Client) { c.headerFunc = build }
 }
@@ -88,6 +90,13 @@ func WithBackoff(initial, longest time.Duration) Option {
 	}
 }
 
+// WithMaxAttempts caps how many connection attempts may fail in a row before the
+// client stops with ErrGaveUp. A welcome resets the count, so it bounds an outage
+// rather than the client's lifetime. Zero, the default, keeps trying until Close.
+func WithMaxAttempts(attempts int) Option {
+	return func(c *Client) { c.maxAttempts = attempts }
+}
+
 // WithSubscribeRetry sets how often an unconfirmed subscribe command is resent.
 // Defaults to half a second, like the JavaScript client's guarantor.
 func WithSubscribeRetry(retry time.Duration) Option {
@@ -102,7 +111,8 @@ func WithMessageBuffer(messages int) Option {
 
 // A SubscriptionOption configures a subscription. Callbacks run on their own
 // goroutine, one at a time, in the order the events happened, so Close,
-// Subscribe, and Unsubscribe all work from inside one.
+// Subscribe, and Unsubscribe all work from inside one. The last of them has
+// returned by the time Messages closes.
 type SubscriptionOption func(*Subscription)
 
 // OnConnected is called every time the server confirms the subscription,

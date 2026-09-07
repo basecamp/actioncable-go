@@ -9,18 +9,23 @@ import "sync"
 // or OnConnected calling Subscribe are both reasonable things to write, and both
 // wait on work only the connection goroutine can do. The queue is unbounded for
 // the same reason — handing an event over must never block the connection.
+//
+// Once stopped it runs what it still holds, then stopped. That is how a
+// subscription closes Messages only after its last callback has returned.
 type dispatcher struct {
 	mu      sync.Mutex
 	pending []func()
 	awake   chan struct{}
 	done    chan struct{}
 	once    sync.Once
+	stopped func()
 }
 
-func newDispatcher() *dispatcher {
+func newDispatcher(stopped func()) *dispatcher {
 	dispatcher := &dispatcher{
-		awake: make(chan struct{}, 1),
-		done:  make(chan struct{}),
+		awake:   make(chan struct{}, 1),
+		done:    make(chan struct{}),
+		stopped: stopped,
 	}
 	go dispatcher.run()
 
@@ -55,6 +60,7 @@ func (d *dispatcher) run() {
 			d.drain()
 		case <-d.done:
 			d.drain()
+			d.stopped()
 			return
 		}
 	}
