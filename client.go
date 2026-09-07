@@ -27,6 +27,7 @@ type Client struct {
 	subscribeRetry time.Duration
 	initialBackoff time.Duration
 	longestBackoff time.Duration
+	maxAttempts    int
 	messageBuffer  int
 
 	// mu guards every field below it.
@@ -36,13 +37,16 @@ type Client struct {
 	protocol      Protocol
 	subscriptions map[string]*registration
 	attempts      int
-	reconnected   bool
-	welcomed      bool
-	everWelcomed  bool
-	stopped       bool
-	failure       error
-	ctx           context.Context
-	cancel        context.CancelFunc
+	// lastErr is why the latest attempt failed, kept so a Connect that gives up
+	// waiting can say what it was waiting on.
+	lastErr      error
+	reconnected  bool
+	welcomed     bool
+	everWelcomed bool
+	stopped      bool
+	failure      error
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	// writeMu serializes writes to the connection. It is its own lock so a slow
 	// write doesn't hold up everything else reading the client's state.
@@ -140,7 +144,11 @@ func originOf(rawURL string) string {
 // Failed connection attempts are retried until that happens, ctx is done, or
 // the server tells us not to come back.
 //
-// ctx bounds the wait, not the client: the connection lives until Close.
+// ctx bounds the wait, not a connection that got through: that lives until Close.
+// A Connect that returns an error leaves the client stopped, with nothing running
+// behind it, so a client that failed to connect is one to throw away. The one
+// exception is ErrAlreadyConnected, which says the client was running fine before
+// the call and still is.
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.stopped {
@@ -164,8 +172,24 @@ func (c *Client) Connect(ctx context.Context) error {
 	case <-c.done:
 		return c.stoppedBecause()
 	case <-ctx.Done():
-		return ctx.Err()
+		return c.giveUpWaiting(ctx)
 	}
+}
+
+// giveUpWaiting stops a client whose Connect ran out of time, unless the welcome
+// landed in the same instant, in which case the connection is kept. Both are
+// settled under one lock, so a welcome can't slip in between the check and the
+// stop and be torn down for its trouble.
+func (c *Client) giveUpWaiting(ctx context.Context) error {
+	c.mu.Lock()
+	if c.everWelcomed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.stopLocked(c.explainLocked(ctx.Err()))
+	c.mu.Unlock()
+
+	return c.awaitStopped()
 }
 
 // Connected reports whether a connection is up and welcomed.
@@ -174,6 +198,28 @@ func (c *Client) Connected() bool {
 	defer c.mu.Unlock()
 
 	return c.welcomed && c.conn != nil
+}
+
+// Done closes when the client has stopped for good — closed, told by the server
+// not to come back, out of attempts, or unable to connect in the first place — and
+// will neither reconnect nor deliver anything more. Err says why.
+func (c *Client) Done() <-chan struct{} {
+	return c.done
+}
+
+// Err reports why the client stopped, and nil while it is still running or has
+// yet to be started. It is one of ErrClosed, ErrGaveUp, ErrUnsupportedSubprotocol,
+// ErrNoProtocols, a *DisconnectError, or the context error a failed Connect
+// returned.
+func (c *Client) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.stopped {
+		return c.failureLocked()
+	} else {
+		return nil
+	}
 }
 
 // Subscribe subscribes to a channel and returns once the server confirms it.
@@ -233,13 +279,15 @@ func (c *Client) Subscribe(ctx context.Context, identifier Identifier, options .
 	case <-subscription.confirmed:
 		return subscription, nil
 	case <-subscription.rejected:
-		c.forget(subscription)
-		return nil, fmt.Errorf("%w: %s", ErrRejected, key)
+		rejection := subscription.rejection()
+		c.forget(subscription, rejection)
+		return nil, rejection
 	case <-c.done:
-		c.forget(subscription)
-		return nil, c.stoppedBecause()
+		failure := c.stoppedBecause()
+		c.forget(subscription, failure)
+		return nil, failure
 	case <-ctx.Done():
-		c.abandon(subscription)
+		c.abandon(subscription, ctx.Err())
 		return nil, ctx.Err()
 	}
 }
@@ -253,8 +301,8 @@ func (c *Client) Subscribe(ctx context.Context, identifier Identifier, options .
 // The caller's context is what just ended, so the unsubscribe goes out on the
 // client's own. It is sent before returning rather than in the background so a
 // Subscribe for the same identifier that follows can't get ahead of it.
-func (c *Client) abandon(subscription *Subscription) {
-	if last, heard := c.forget(subscription); last && heard {
+func (c *Client) abandon(subscription *Subscription, reason error) {
+	if last, heard := c.forget(subscription, reason); last && heard {
 		c.send(c.runContext(), Command{Name: CommandUnsubscribe, Identifier: subscription.identifier})
 	}
 }
@@ -272,18 +320,35 @@ func (c *Client) runContext() context.Context {
 // channel. It is safe to call from a subscription callback, and safe to call
 // twice.
 func (c *Client) Close() error {
+	c.shutdown(ErrClosed)
+
+	return nil
+}
+
+// shutdown stops the client for the reason given, hangs up whatever connection
+// is open, and waits for the connection goroutine to finish. Subscription
+// callbacks still queued run on their own goroutines after that, and each
+// subscription's Messages closes once its last one has. It returns why the client
+// stopped, which is an earlier reason when there was one.
+func (c *Client) shutdown(reason error) error {
 	c.mu.Lock()
-	cancel, conn := c.cancel, c.conn
-	c.stopped = true
-	if c.failure == nil {
-		c.failure = ErrClosed
-	}
+	c.stopLocked(reason)
+	c.mu.Unlock()
+
+	return c.awaitStopped()
+}
+
+// awaitStopped hangs up whatever connection a stopped client still has open and
+// waits until nothing is running any more.
+func (c *Client) awaitStopped() error {
+	c.mu.Lock()
+	failure, cancel, conn := c.failure, c.cancel, c.conn
 	c.mu.Unlock()
 
 	if cancel == nil {
 		// Nothing was ever started, so nothing will finish it for us.
 		c.finish()
-		return nil
+		return failure
 	}
 
 	cancel()
@@ -292,7 +357,7 @@ func (c *Client) Close() error {
 	}
 	<-c.done
 
-	return nil
+	return failure
 }
 
 func (c *Client) run(ctx context.Context) {
@@ -300,15 +365,14 @@ func (c *Client) run(ctx context.Context) {
 	defer c.closeSubscriptions()
 
 	for {
-		if err := c.session(ctx); err != nil && !c.isStopped() {
+		err := c.session(ctx)
+		if err != nil && !c.isStopped() {
 			c.logger.Printf("actioncable: connection to %s ended: %v", c.url, err)
 		}
 
 		if c.isStopped() || ctx.Err() != nil {
 			return
 		}
-
-		c.countAttempt()
 
 		select {
 		case <-ctx.Done():
@@ -326,7 +390,7 @@ func (c *Client) session(ctx context.Context) error {
 
 	header, err := c.dialHeader(ctx)
 	if err != nil {
-		return err
+		return c.failed(ctx, err)
 	}
 
 	conn, err := c.transport.Dial(ctx, c.url, DialOptions{
@@ -334,7 +398,7 @@ func (c *Client) session(ctx context.Context) error {
 		Header:       header,
 	})
 	if err != nil {
-		return err
+		return c.failed(ctx, err)
 	}
 	defer conn.Close()
 
@@ -359,7 +423,22 @@ func (c *Client) session(ctx context.Context) error {
 		<-guaranteed
 	}()
 
-	return c.receive(ctx, conn, protocol)
+	return c.failed(ctx, c.receive(ctx, conn, protocol))
+}
+
+// failed records why an attempt ended and, when that was the last one allowed,
+// stops the client. It runs ahead of the deferred disconnect so the subscriptions
+// hear that the client is not coming back rather than that it is.
+func (c *Client) failed(ctx context.Context, err error) error {
+	if c.isStopped() || ctx.Err() != nil {
+		return err
+	}
+
+	if c.countAttempt(err) == c.maxAttempts {
+		c.stop(c.explain(ErrGaveUp))
+	}
+
+	return err
 }
 
 // subprotocols names every protocol the client can speak, most preferred first.
@@ -598,7 +677,7 @@ func (c *Client) write(ctx context.Context, command Command) error {
 // forget drops a subscription and reports whether it was the last one holding
 // that identifier, which is when the server needs to hear about it, and whether
 // the server has heard a subscribe for it on the connection in hand at all.
-func (c *Client) forget(subscription *Subscription) (last, heard bool) {
+func (c *Client) forget(subscription *Subscription, reason error) (last, heard bool) {
 	c.mu.Lock()
 	remaining := []*Subscription{}
 	for _, candidate := range c.holdersLocked(subscription.identifier) {
@@ -617,7 +696,7 @@ func (c *Client) forget(subscription *Subscription) (last, heard bool) {
 	}
 	c.mu.Unlock()
 
-	subscription.close()
+	subscription.close(reason)
 
 	return last, heard
 }
@@ -626,10 +705,11 @@ func (c *Client) closeSubscriptions() {
 	c.mu.Lock()
 	subscriptions := c.allSubscriptionsLocked()
 	c.subscriptions = map[string]*registration{}
+	failure := c.failureLocked()
 	c.mu.Unlock()
 
 	for _, subscription := range subscriptions {
-		subscription.close()
+		subscription.close(failure)
 	}
 }
 
@@ -668,10 +748,7 @@ func (c *Client) pendingIdentifiers() []string {
 // dialing again.
 func (c *Client) stop(err error) error {
 	c.mu.Lock()
-	c.stopped = true
-	if c.failure == nil {
-		c.failure = err
-	}
+	c.stopLocked(err)
 	cancel := c.cancel
 	c.mu.Unlock()
 
@@ -680,6 +757,15 @@ func (c *Client) stop(err error) error {
 	}
 
 	return err
+}
+
+// stopLocked marks the client stopped for the reason given, unless an earlier
+// reason already stands.
+func (c *Client) stopLocked(reason error) {
+	c.stopped = true
+	if c.failure == nil {
+		c.failure = reason
+	}
 }
 
 func (c *Client) finish() {
@@ -708,11 +794,33 @@ func (c *Client) failureLocked() error {
 	}
 }
 
-func (c *Client) countAttempt() {
+// countAttempt records one more failed attempt, and what failed it, and reports
+// how many have failed in a row.
+func (c *Client) countAttempt(err error) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.attempts++
+	c.lastErr = err
+
+	return c.attempts
+}
+
+// explain pairs an error about giving up with the failure that was being waited
+// out, so a deadline that ran out on bad credentials says so.
+func (c *Client) explain(err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.explainLocked(err)
+}
+
+func (c *Client) explainLocked(err error) error {
+	if c.lastErr != nil {
+		return fmt.Errorf("%w (last attempt: %w)", err, c.lastErr)
+	} else {
+		return err
+	}
 }
 
 // reconnectDelay doubles the delay per failed attempt, up to the longest, and

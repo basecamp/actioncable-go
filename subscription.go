@@ -26,6 +26,7 @@ type Subscription struct {
 	sendMu   sync.Mutex
 	messages chan Message
 	closed   bool
+	reason   error
 
 	confirmOnce sync.Once
 	rejectOnce  sync.Once
@@ -38,8 +39,8 @@ func newSubscription(client *Client, identifier string, buffer int, options []Su
 		messages:   make(chan Message, buffer),
 		confirmed:  make(chan struct{}),
 		rejected:   make(chan struct{}),
-		callbacks:  newDispatcher(),
 	}
+	subscription.callbacks = newDispatcher(subscription.closeMessages)
 
 	for _, option := range options {
 		option(subscription)
@@ -75,14 +76,23 @@ func (s *Subscription) Key() string {
 }
 
 // Messages carries everything the channel broadcasts or transmits to this
-// subscription. It closes when the subscription is unsubscribed or the client is
-// closed.
+// subscription. It closes when the subscription is unsubscribed, rejected, or the
+// client stops, once the last callback has returned — Err says which it was.
 //
 // Read it promptly. Messages that arrive with the buffer full are dropped and
 // logged rather than stalling the connection — WithMessageBuffer sizes the buffer
 // for a slow consumer.
 func (s *Subscription) Messages() <-chan Message {
 	return s.messages
+}
+
+// Err reports why the subscription ended: ErrUnsubscribed, ErrRejected, or
+// whatever stopped the client. It is nil while the subscription is live.
+func (s *Subscription) Err() error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
+	return s.reason
 }
 
 // Perform invokes an action on the channel — the equivalent of the JavaScript
@@ -107,10 +117,12 @@ func (s *Subscription) Send(ctx context.Context, data any) error {
 	return s.client.send(ctx, Command{Name: CommandMessage, Identifier: s.identifier, Data: string(payload)})
 }
 
-// Unsubscribe tells the server to drop the subscription and closes Messages.
-func (s *Subscription) Unsubscribe(ctx context.Context) error {
-	if last, _ := s.client.forget(s); last {
-		return s.client.send(ctx, Command{Name: CommandUnsubscribe, Identifier: s.identifier})
+// Unsubscribe tells the server to drop the subscription and closes Messages. The
+// command goes out on the client's own connection, so it works from a context
+// that has already ended — which, at teardown, is usually the one at hand.
+func (s *Subscription) Unsubscribe() error {
+	if last, _ := s.client.forget(s, ErrUnsubscribed); last {
+		return s.client.send(s.client.runContext(), Command{Name: CommandUnsubscribe, Identifier: s.identifier})
 	} else {
 		return nil
 	}
@@ -123,11 +135,13 @@ func (s *Subscription) confirm(reconnected bool) {
 		return
 	}
 
-	s.confirmOnce.Do(func() { close(s.confirmed) })
-
+	// The callback is queued before the verdict is published: a Subscribe woken
+	// by the verdict may unsubscribe at once, and that must not get ahead of the
+	// callback for the event that woke it.
 	if s.onConnected != nil {
 		s.callbacks.dispatch(func() { s.onConnected(reconnected) })
 	}
+	s.confirmOnce.Do(func() { close(s.confirmed) })
 }
 
 func (s *Subscription) isClosed() bool {
@@ -138,12 +152,15 @@ func (s *Subscription) isClosed() bool {
 }
 
 func (s *Subscription) reject() {
-	s.rejectOnce.Do(func() { close(s.rejected) })
-
 	if s.onRejected != nil {
 		s.callbacks.dispatch(s.onRejected)
 	}
-	s.close()
+	s.rejectOnce.Do(func() { close(s.rejected) })
+	s.close(s.rejection())
+}
+
+func (s *Subscription) rejection() error {
+	return fmt.Errorf("%w: %s", ErrRejected, s.identifier)
 }
 
 func (s *Subscription) disconnect(willReconnect bool) {
@@ -169,15 +186,22 @@ func (s *Subscription) deliver(message Message) bool {
 	}
 }
 
-func (s *Subscription) close() {
+// close ends the subscription for the reason given. Deliveries stop at once;
+// Messages itself closes from the callback goroutine, after the callbacks already
+// queued have run, so a reader that sees it close knows no callback is behind it.
+func (s *Subscription) close(reason error) {
 	s.sendMu.Lock()
 	if !s.closed {
 		s.closed = true
-		close(s.messages)
+		s.reason = reason
 	}
 	s.sendMu.Unlock()
 
 	s.callbacks.stop()
+}
+
+func (s *Subscription) closeMessages() {
+	close(s.messages)
 }
 
 func performPayload(action string, data any) ([]byte, error) {

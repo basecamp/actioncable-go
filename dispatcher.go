@@ -9,18 +9,24 @@ import "sync"
 // or OnConnected calling Subscribe are both reasonable things to write, and both
 // wait on work only the connection goroutine can do. The queue is unbounded for
 // the same reason — handing an event over must never block the connection.
+//
+// Once stopped it runs what it still holds, turns away anything handed to it
+// after that, then calls afterStop. That is how a subscription closes Messages
+// only after its last callback has returned, with none left behind unrun.
 type dispatcher struct {
-	mu      sync.Mutex
-	pending []func()
-	awake   chan struct{}
-	done    chan struct{}
-	once    sync.Once
+	mu        sync.Mutex
+	pending   []func()
+	stopping  bool
+	awake     chan struct{}
+	done      chan struct{}
+	afterStop func()
 }
 
-func newDispatcher() *dispatcher {
+func newDispatcher(afterStop func()) *dispatcher {
 	dispatcher := &dispatcher{
-		awake: make(chan struct{}, 1),
-		done:  make(chan struct{}),
+		awake:     make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		afterStop: afterStop,
 	}
 	go dispatcher.run()
 
@@ -33,8 +39,12 @@ func (d *dispatcher) dispatch(callback func()) {
 	}
 
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.stopping {
+		return
+	}
 	d.pending = append(d.pending, callback)
-	d.mu.Unlock()
 
 	select {
 	case d.awake <- struct{}{}:
@@ -45,7 +55,13 @@ func (d *dispatcher) dispatch(callback func()) {
 // stop lets the dispatcher finish what it has and go away. It doesn't wait,
 // since a callback is allowed to be what stopped it.
 func (d *dispatcher) stop() {
-	d.once.Do(func() { close(d.done) })
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.stopping {
+		d.stopping = true
+		close(d.done)
+	}
 }
 
 func (d *dispatcher) run() {
@@ -55,6 +71,7 @@ func (d *dispatcher) run() {
 			d.drain()
 		case <-d.done:
 			d.drain()
+			d.afterStop()
 			return
 		}
 	}

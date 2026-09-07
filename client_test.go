@@ -135,7 +135,7 @@ func TestUnsubscribeClosesMessagesAndTellsTheServer(t *testing.T) {
 	conn := welcomed(t, client, transport)
 	subscription := subscribed(t, client, conn)
 
-	require.NoError(t, subscription.Unsubscribe(context.Background()), "Unsubscribe")
+	require.NoError(t, subscription.Unsubscribe(), "Unsubscribe")
 	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 
 	select {
@@ -327,10 +327,10 @@ func TestMessagesArriveOnEverySubscriptionSharingAnIdentifier(t *testing.T) {
 	}
 
 	// Only the last subscription standing tells the server to unsubscribe.
-	require.NoError(t, first.Unsubscribe(context.Background()), "Unsubscribe")
+	require.NoError(t, first.Unsubscribe(), "Unsubscribe")
 	conn.expectNoCommand(t)
 
-	require.NoError(t, second.Unsubscribe(context.Background()), "Unsubscribe")
+	require.NoError(t, second.Unsubscribe(), "Unsubscribe")
 	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 }
 
@@ -530,7 +530,7 @@ func TestUnsubscribeWhileMessagesArrive(t *testing.T) {
 			conn.push(t, `{"identifier":`+quote(roomIdentifier)+`,"message":{"body":"Hello!"}}`)
 		}()
 
-		require.NoError(t, subscription.Unsubscribe(context.Background()), "Unsubscribe")
+		require.NoError(t, subscription.Unsubscribe(), "Unsubscribe")
 		<-pushed
 		conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 	}
@@ -703,7 +703,7 @@ func TestAnUnsubscribeDuringAResubscribeGoesOutAfterIt(t *testing.T) {
 	reconnected.welcome(t)
 	<-reconnected.writing
 	unsubscribing := make(chan error, 1)
-	go func() { unsubscribing <- result.subscription.Unsubscribe(context.Background()) }()
+	go func() { unsubscribing <- result.subscription.Unsubscribe() }()
 	time.Sleep(20 * time.Millisecond)
 
 	first := reconnected.command(t)
@@ -712,4 +712,226 @@ func TestAnUnsubscribeDuringAResubscribeGoesOutAfterIt(t *testing.T) {
 	assert.ElementsMatch(t, []string{roomIdentifier, other}, []string{first.Identifier, second.Identifier})
 	reconnected.expectCommand(t, CommandUnsubscribe, other)
 	require.NoError(t, <-unsubscribing, "Unsubscribe")
+}
+
+func TestAConnectThatRunsOutOfTimeStopsTheClient(t *testing.T) {
+	transport := newFakeTransport()
+	transport.failNextDial(errors.New("connection refused"))
+	client := newTestClient(t, transport, WithBackoff(time.Hour, time.Hour))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := client.Connect(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.ErrorContains(t, err, "connection refused", "expected the error to say what the client was waiting out")
+
+	select {
+	case <-client.Done():
+	case <-time.After(wait):
+		t.Fatal("client kept running after Connect gave up")
+	}
+	require.ErrorIs(t, client.Err(), context.DeadlineExceeded)
+	require.ErrorIs(t, client.Connect(context.Background()), context.DeadlineExceeded, "expected a second Connect to report the first one's failure")
+	transport.refuseDial(t)
+}
+
+func TestAConnectThatRunsOutOfTimeNamesTheHeaderThatFailed(t *testing.T) {
+	transport := newFakeTransport()
+	noCredentials := errors.New("no credentials to hand over")
+	client := newTestClient(t, transport,
+		WithBackoff(time.Millisecond, time.Millisecond),
+		WithHeaderFunc(func(context.Context) (http.Header, error) { return nil, noCredentials }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := client.Connect(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorIs(t, err, noCredentials, "expected the header error to be wrapped rather than hidden by the deadline")
+	transport.refuseDial(t)
+}
+
+func TestMaxAttemptsStopsTheClient(t *testing.T) {
+	transport := newFakeTransport()
+	refused := errors.New("connection refused")
+	transport.failNextDial(refused)
+	transport.failNextDial(refused)
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond), WithMaxAttempts(2))
+
+	err := client.Connect(context.Background())
+	require.ErrorIs(t, err, ErrGaveUp)
+	require.ErrorIs(t, err, refused, "expected the last attempt's error to be wrapped")
+
+	select {
+	case <-client.Done():
+	case <-time.After(wait):
+		t.Fatal("client kept running after its attempts ran out")
+	}
+	require.ErrorIs(t, client.Err(), ErrGaveUp)
+	transport.refuseDial(t)
+}
+
+func TestAWelcomeResetsTheAttemptCount(t *testing.T) {
+	transport := newFakeTransport()
+	transport.failNextDial(errors.New("connection refused"))
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond), WithMaxAttempts(3))
+	conn := welcomed(t, client, transport)
+
+	// Losing the connection is the first failed attempt of the outage, and the
+	// refused redial the second. Had the failure before the welcome still
+	// counted, that would have been the third.
+	transport.failNextDial(errors.New("connection refused"))
+	conn.Close()
+
+	transport.accept(t).welcome(t)
+	assert.NoError(t, client.Err(), "a failure before the welcome should not count against the outage after it")
+}
+
+func TestGivingUpTellsSubscriptionsTheClientIsNotComingBack(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond), WithMaxAttempts(1))
+	conn := welcomed(t, client, transport)
+
+	disconnections := make(chan bool, 1)
+	subscribing := subscribe(client, room(), OnDisconnected(func(willReconnect bool) { disconnections <- willReconnect }))
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	conn.confirm(t, roomIdentifier)
+	require.NoError(t, (<-subscribing).err, "Subscribe")
+
+	// Losing the connection is the only attempt allowed, so the client is done
+	// for, and the subscription should hear that rather than a promise to return.
+	conn.Close()
+
+	assert.False(t, <-disconnections, "OnDisconnected promised a reconnect the client was about to give up on")
+	select {
+	case <-client.Done():
+	case <-time.After(wait):
+		t.Fatal("client kept running after its attempts ran out")
+	}
+	require.ErrorIs(t, client.Err(), ErrGaveUp)
+	transport.refuseDial(t)
+}
+
+func TestDoneAndErrFollowTheClient(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
+
+	assert.NoError(t, client.Err(), "a client that hasn't started has nothing to report")
+	conn := welcomed(t, client, transport)
+	assert.NoError(t, client.Err(), "a running client has nothing to report")
+	select {
+	case <-client.Done():
+		t.Fatal("Done closed on a running client")
+	default:
+	}
+
+	conn.push(t, `{"type":"disconnect","reason":"unauthorized","reconnect":false}`)
+
+	select {
+	case <-client.Done():
+	case <-time.After(wait):
+		t.Fatal("Done never closed after the server hung up for good")
+	}
+
+	var disconnect *DisconnectError
+	require.ErrorAs(t, client.Err(), &disconnect)
+	assert.Equal(t, ReasonUnauthorized, disconnect.Reason)
+}
+
+func TestMessagesCloseAfterTheLastCallbackReturns(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	subscribing := subscribe(client, room(), OnDisconnected(func(bool) {
+		close(entered)
+		<-release
+	}))
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	conn.confirm(t, roomIdentifier)
+	result := <-subscribing
+	require.NoError(t, result.err, "Subscribe")
+	subscription := result.subscription
+
+	require.NoError(t, client.Close(), "Close")
+	<-entered
+
+	select {
+	case _, open := <-subscription.Messages():
+		require.True(t, open, "messages channel closed while a callback was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case _, open := <-subscription.Messages():
+		assert.False(t, open, "messages channel is still delivering after the last callback")
+	case <-time.After(wait):
+		t.Fatal("messages channel never closed")
+	}
+	require.ErrorIs(t, subscription.Err(), ErrClosed)
+}
+
+func TestUnsubscribedSubscriptionReportsWhy(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+	subscription := subscribed(t, client, conn)
+
+	assert.NoError(t, subscription.Err(), "a live subscription has nothing to report")
+
+	require.NoError(t, subscription.Unsubscribe(), "Unsubscribe")
+	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
+
+	require.ErrorIs(t, subscription.Err(), ErrUnsubscribed)
+}
+
+func TestRejectionAfterAReconnectReportsWhy(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport, WithBackoff(time.Millisecond, time.Millisecond))
+	conn := welcomed(t, client, transport)
+	subscription := subscribed(t, client, conn)
+
+	conn.Close()
+
+	reconnected := transport.accept(t)
+	reconnected.welcome(t)
+	reconnected.expectCommand(t, CommandSubscribe, roomIdentifier)
+	reconnected.push(t, `{"type":"reject_subscription","identifier":`+quote(roomIdentifier)+`}`)
+
+	select {
+	case _, open := <-subscription.Messages():
+		assert.False(t, open, "messages channel is still delivering after a rejection")
+	case <-time.After(wait):
+		t.Fatal("messages channel never closed")
+	}
+	require.ErrorIs(t, subscription.Err(), ErrRejected)
+}
+
+func TestUnsubscribeNeedsNoContext(t *testing.T) {
+	transport := newFakeTransport()
+	client := newTestClient(t, transport)
+	conn := welcomed(t, client, transport)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	subscribing := make(chan subscribeResult, 1)
+	go func() {
+		subscription, err := client.Subscribe(ctx, room())
+		subscribing <- subscribeResult{subscription, err}
+	}()
+	conn.expectCommand(t, CommandSubscribe, roomIdentifier)
+	conn.confirm(t, roomIdentifier)
+	result := <-subscribing
+	require.NoError(t, result.err, "Subscribe")
+
+	// The context the subscription was made under is long gone by the time the
+	// caller is tearing down, and that must not stop the hang-up from going out.
+	cancel()
+
+	require.NoError(t, result.subscription.Unsubscribe(), "Unsubscribe")
+	conn.expectCommand(t, CommandUnsubscribe, roomIdentifier)
 }
